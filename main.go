@@ -37,7 +37,6 @@ type AVLData struct {
 // --- Global config ---
 var (
 	tcpServerHost   string
-	devicesPostURL  string
 	backendTrackURL string
 	db              *sql.DB
 	httpClient      = &http.Client{Timeout: 10 * time.Second}
@@ -47,10 +46,9 @@ func init() {
 	_ = godotenv.Load()
 
 	tcpServerHost = getEnv("TCP_SERVER_HOST", "0.0.0.0:5027")
-	devicesPostURL = getEnv("DEVICES_POST_URL", "")
 	backendTrackURL = getEnv("BACKEND_TRACK_URL", "https://mytrack-production.up.railway.app/api/track")
 
-	pgURL := getEnv("POSTGRES_URL", "postgres://user:pass@localhost:5432/tracker?sslmode=disable")
+	pgURL := getEnv("POSTGRES_URL", "postgresql://postgres:password@localhost:5432/tracker?sslmode=disable")
 	var err error
 	db, err = sql.Open("postgres", pgURL)
 	if err != nil {
@@ -96,7 +94,7 @@ func handleConnection(conn net.Conn) {
 
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
-		log.Printf("❌ Device registration failed: %v", err)
+		log.Printf("❌ Device lookup failed: %v", err)
 		return
 	}
 
@@ -164,35 +162,40 @@ func readIMEI(conn net.Conn) (string, error) {
 	return imei, nil
 }
 
-// --- Ensure device exists ---
+// --- Ensure device exists via backend list ---
 func ensureDevice(imei string) (int, error) {
+	// Check PostgreSQL cache first
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
 
-	data, _ := json.Marshal(map[string]string{"imei": imei})
-	req, _ := http.NewRequest("POST", devicesPostURL, bytes.NewBuffer(data))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	// Fetch devices list from backend
+	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to GET devices list: %v", err)
 	}
 	defer resp.Body.Close()
 
-	var newDevice Device
 	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &newDevice); err != nil {
-		return 0, err
+	var devices []struct {
+		ID   int    `json:"id"`
+		IMEI string `json:"imei"`
+	}
+	if err := json.Unmarshal(body, &devices); err != nil {
+		return 0, fmt.Errorf("failed to parse devices list: %v\n%s", err, string(body))
 	}
 
-	_, err = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", newDevice.ID, imei)
-	if err != nil {
-		return 0, err
+	for _, d := range devices {
+		if d.IMEI == imei {
+			// Cache device in PostgreSQL
+			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
+			return d.ID, nil
+		}
 	}
 
-	return newDevice.ID, nil
+	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
 // --- Parse multiple AVL records ---
