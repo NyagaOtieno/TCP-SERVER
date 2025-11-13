@@ -17,6 +17,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Default fallback coordinates (Bermuda Triangle midpoint)
+const (
+	defaultLat = 25.0000
+	defaultLon = -71.0000
+)
+
 // Device represents a registered device
 type Device struct {
 	ID   int    `json:"id"`
@@ -108,7 +114,7 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		avlRecords, err := parseAVLRecords(data[:n])
+		avlRecords, err := parseAVLRecords(data[:n], imei)
 		if err != nil {
 			log.Printf("❌ Failed to parse AVL for %s: %v", imei, err)
 			continue
@@ -196,7 +202,7 @@ func ensureDevice(imei string) (int, error) {
 }
 
 // --- Parse multiple AVL records ---
-func parseAVLRecords(data []byte) ([]*AVLData, error) {
+func parseAVLRecords(data []byte, imei string) ([]*AVLData, error) {
 	var records []*AVLData
 	reader := bytes.NewReader(data)
 
@@ -210,6 +216,14 @@ func parseAVLRecords(data []byte) ([]*AVLData, error) {
 		if err != nil {
 			continue
 		}
+
+		// Fallback for zero coordinates
+		if avl.Latitude == 0 && avl.Longitude == 0 {
+			log.Printf("⚠️ Device %s sent zero coordinates. Applying fallback to Bermuda Triangle midpoint.", imei)
+			avl.Latitude = defaultLat
+			avl.Longitude = defaultLon
+		}
+
 		records = append(records, avl)
 	}
 
@@ -225,24 +239,17 @@ func parseAVLPacket(data []byte) (*AVLData, error) {
 	timestampMs := binary.BigEndian.Uint64(data[0:8])
 	timestamp := time.UnixMilli(int64(timestampMs))
 
-	latRaw := int32(binary.BigEndian.Uint32(data[9:13]))
-	lonRaw := int32(binary.BigEndian.Uint32(data[13:17]))
+	lon := int32(binary.BigEndian.Uint32(data[9:13]))
+	lat := int32(binary.BigEndian.Uint32(data[13:17]))
 	alt := int(binary.BigEndian.Uint16(data[17:19]))
 	angle := int(binary.BigEndian.Uint16(data[19:21]))
 	sat := int(data[21])
 	speed := int(binary.BigEndian.Uint16(data[22:24]))
 
-	latitude := float64(latRaw) / 1e7
-	longitude := float64(lonRaw) / 1e7
-
-	if latitude == 0 || longitude == 0 {
-		return nil, fmt.Errorf("invalid coordinates")
-	}
-
 	return &AVLData{
 		Timestamp:  timestamp,
-		Latitude:   latitude,
-		Longitude:  longitude,
+		Latitude:   float64(lat) / 1e7,
+		Longitude:  float64(lon) / 1e7,
 		Altitude:   alt,
 		Angle:      angle,
 		Satellites: sat,
@@ -271,10 +278,6 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer stmt.Close()
 
 	for _, avl := range records {
-		if avl.Latitude == 0 || avl.Longitude == 0 {
-			log.Println("⚠️ Skipping invalid coordinates:", avl)
-			continue
-		}
 		if _, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites); err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
