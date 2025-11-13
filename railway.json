@@ -1,6 +1,6 @@
 {
   "build": {
-    "buildCommand": "go build -ldflags=-w -s -o out main.go",
+    "buildCommand": "go build -ldflags=\"-s -w\" -o out main.go",
     "startCommand": "./out"
   },
   "deploy": {
