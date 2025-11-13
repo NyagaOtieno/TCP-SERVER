@@ -17,12 +17,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// --- Default fallback coordinates (Bermuda Triangle midpoint) ---
-const (
-	defaultLat = 25.0000
-	defaultLon = -71.0000
-)
-
 // Device represents a registered device
 type Device struct {
 	ID   int    `json:"id"`
@@ -39,6 +33,12 @@ type AVLData struct {
 	Satellites int
 	Speed      int
 }
+
+// Default fallback coordinates (Bermuda Triangle midpoint)
+const (
+	defaultLat = 25.0000
+	defaultLon = -71.0000
+)
 
 // --- Global config ---
 var (
@@ -114,7 +114,7 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		avlRecords, err := parseAVLRecords(data[:n], imei)
+		avlRecords, err := parseAVLRecords(data[:n])
 		if err != nil {
 			log.Printf("❌ Failed to parse AVL for %s: %v", imei, err)
 			continue
@@ -202,7 +202,7 @@ func ensureDevice(imei string) (int, error) {
 }
 
 // --- Parse multiple AVL records ---
-func parseAVLRecords(data []byte, imei string) ([]*AVLData, error) {
+func parseAVLRecords(data []byte) ([]*AVLData, error) {
 	var records []*AVLData
 	reader := bytes.NewReader(data)
 
@@ -217,9 +217,9 @@ func parseAVLRecords(data []byte, imei string) ([]*AVLData, error) {
 			continue
 		}
 
-		// --- Apply fallback if zero coordinates ---
+		// Apply fallback if zero coordinates
 		if avl.Latitude == 0 || avl.Longitude == 0 {
-			log.Printf("⚠️ Device %s sent zero coordinates. Using Bermuda Triangle fallback.", imei)
+			log.Printf("⚠️ Device sending zero coordinates, using fallback Bermuda Triangle location")
 			avl.Latitude = defaultLat
 			avl.Longitude = defaultLon
 		}
@@ -239,27 +239,17 @@ func parseAVLPacket(data []byte) (*AVLData, error) {
 	timestampMs := binary.BigEndian.Uint64(data[0:8])
 	timestamp := time.UnixMilli(int64(timestampMs))
 
-	lonRaw := int32(binary.BigEndian.Uint32(data[9:13]))
-	latRaw := int32(binary.BigEndian.Uint32(data[13:17]))
-	alt := int(binary.BigEndian.Uint16(data[17:19]))
-	angle := int(binary.BigEndian.Uint16(data[19:21]))
-	sat := int(data[21])
-	speed := int(binary.BigEndian.Uint16(data[22:24]))
-
-	lat := float64(latRaw) / 1e7
-	lon := float64(lonRaw) / 1e7
-
-	// --- Fallback at parse level ---
-	if lat == 0 || lon == 0 {
-		log.Printf("⚠️ Packet has zero coordinates. Applying Bermuda Triangle fallback.")
-		lat = defaultLat
-		lon = defaultLon
-	}
+	lon := int32(binary.BigEndian.Uint32(data[8:12])) // corrected offset
+	lat := int32(binary.BigEndian.Uint32(data[12:16]))
+	alt := int(binary.BigEndian.Uint16(data[16:18]))
+	angle := int(binary.BigEndian.Uint16(data[18:20]))
+	sat := int(data[20])
+	speed := int(binary.BigEndian.Uint16(data[21:23]))
 
 	return &AVLData{
 		Timestamp:  timestamp,
-		Latitude:   lat,
-		Longitude:  lon,
+		Latitude:   float64(lat) / 1e7,
+		Longitude:  float64(lon) / 1e7,
 		Altitude:   alt,
 		Angle:      angle,
 		Satellites: sat,
