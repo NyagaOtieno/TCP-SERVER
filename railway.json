@@ -1,6 +1,5 @@
 {
   "build": {
-    "builder": "docker",
     "buildCommand": "go build -ldflags=-w -s -o out main.go",
     "startCommand": "./out"
   },
