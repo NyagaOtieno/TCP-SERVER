@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -9,253 +10,290 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"time"
+
+	_ "github.com/lib/pq"
+	"github.com/joho/godotenv"
 )
 
-// Device represents a device on the backend
+// Device represents a registered device
 type Device struct {
 	ID   int    `json:"id"`
 	IMEI string `json:"imei"`
 }
 
-// Position struct for sending positions
-type Position struct {
-	DeviceID  int     `json:"device_id"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	Speed     int     `json:"speed"`
-	Altitude  int     `json:"altitude"`
-	Angle     int     `json:"angle"`
-	Timestamp string  `json:"timestamp"`
+// AVLData represents a parsed FMB920 AVL packet
+type AVLData struct {
+	Timestamp  time.Time
+	Latitude   float64
+	Longitude  float64
+	Altitude   int
+	Angle      int
+	Satellites int
+	Speed      int
 }
 
-const (
-	tcpServerHost     = "127.0.0.1:5027"
-	devicesPostURL    = "https://mytrack-production.up.railway.app/api/devices/create"
-	devicesListURL    = "https://mytrack-production.up.railway.app/api/devices/list"
-	positionsPostURL  = "https://mytrack-production.up.railway.app/api/track"
-	deviceLatestURL   = "https://mytrack-production.up.railway.app/api/devices/latest?imei="
+// --- Global config ---
+var (
+	tcpServerHost   string
+	devicesPostURL  string
+	backendTrackURL string
+	db              *sql.DB
+	httpClient      = &http.Client{Timeout: 10 * time.Second}
 )
 
-var imeis = []string{
-	"359016073166828",
-	"359016073166829",
-	"359016073166830",
+func init() {
+	_ = godotenv.Load()
+
+	tcpServerHost = getEnv("TCP_SERVER_HOST", "0.0.0.0:5027")
+	devicesPostURL = getEnv("DEVICES_POST_URL", "")
+	backendTrackURL = getEnv("BACKEND_TRACK_URL", "https://mytrack-production.up.railway.app/api/track")
+
+	pgURL := getEnv("POSTGRES_URL", "postgres://user:pass@localhost:5432/tracker?sslmode=disable")
+	var err error
+	db, err = sql.Open("postgres", pgURL)
+	if err != nil {
+		log.Fatalf("❌ Failed to connect to PostgreSQL: %v", err)
+	}
+
+	if err = db.Ping(); err != nil {
+		log.Fatalf("❌ PostgreSQL ping failed: %v", err)
+	}
+
+	log.Println("✅ Configuration loaded, PostgreSQL connected")
 }
 
+// --- Main ---
 func main() {
+	listener, err := net.Listen("tcp", tcpServerHost)
+	if err != nil {
+		log.Fatalf("❌ Failed to start TCP server: %v", err)
+	}
+	defer listener.Close()
+	log.Println("✅ TCP Server listening on", tcpServerHost)
+
 	for {
-		if err := runForwarder(); err != nil {
-			log.Println("⚠️ Error:", err)
-			log.Println("🔄 Reconnecting in 5s...")
-			time.Sleep(5 * time.Second)
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("⚠️ Failed to accept connection:", err)
+			continue
 		}
+		go handleConnection(conn)
 	}
 }
 
-func runForwarder() error {
-	// Step 1: ensure devices exist on backend
-	devicesMap, err := ensureDevices(imeis)
+// --- Handle incoming device connection ---
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	imei, err := readIMEI(conn)
+	if err != nil {
+		log.Println("❌ Failed to read IMEI:", err)
+		return
+	}
+	log.Printf("📡 Device connected: %s", imei)
+
+	deviceID, err := ensureDevice(imei)
+	if err != nil {
+		log.Printf("❌ Device registration failed: %v", err)
+		return
+	}
+
+	for {
+		data := make([]byte, 4096)
+		n, err := conn.Read(data)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("🔌 Read error for %s: %v", imei, err)
+			}
+			return
+		}
+
+		avlRecords, err := parseAVLRecords(data[:n])
+		if err != nil {
+			log.Printf("❌ Failed to parse AVL for %s: %v", imei, err)
+			continue
+		}
+
+		if len(avlRecords) == 0 {
+			continue
+		}
+
+		if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
+			log.Printf("❌ Failed to store batch positions: %v", err)
+		} else {
+			log.Printf("📍 %d positions saved for %s", len(avlRecords), imei)
+		}
+
+		// Forward all records to backend
+		var backendPayload []map[string]interface{}
+		for _, avl := range avlRecords {
+			backendPayload = append(backendPayload, map[string]interface{}{
+				"device_id":  deviceID,
+				"imei":       imei,
+				"timestamp":  avl.Timestamp.Format(time.RFC3339),
+				"latitude":   avl.Latitude,
+				"longitude":  avl.Longitude,
+				"speed":      avl.Speed,
+				"angle":      avl.Angle,
+				"altitude":   avl.Altitude,
+				"satellites": avl.Satellites,
+			})
+		}
+		if err := postPositionsToBackend(backendPayload); err != nil {
+			log.Printf("❌ Failed to forward to backend: %v", err)
+		} else {
+			log.Printf("📤 %d positions forwarded to backend for %s", len(avlRecords), imei)
+		}
+
+		// ACK
+		conn.Write([]byte{0x01})
+	}
+}
+
+// --- Read IMEI ---
+func readIMEI(conn net.Conn) (string, error) {
+	buf := make([]byte, 32)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return "", err
+	}
+	imei := string(buf[1:n])
+	conn.Write([]byte{0x01}) // ACK
+	return imei, nil
+}
+
+// --- Ensure device exists ---
+func ensureDevice(imei string) (int, error) {
+	var id int
+	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+
+	data, _ := json.Marshal(map[string]string{"imei": imei})
+	req, _ := http.NewRequest("POST", devicesPostURL, bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	var newDevice Device
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &newDevice); err != nil {
+		return 0, err
+	}
+
+	_, err = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", newDevice.ID, imei)
+	if err != nil {
+		return 0, err
+	}
+
+	return newDevice.ID, nil
+}
+
+// --- Parse multiple AVL records ---
+func parseAVLRecords(data []byte) ([]*AVLData, error) {
+	var records []*AVLData
+	reader := bytes.NewReader(data)
+
+	for reader.Len() >= 25 { // Minimum packet size
+		packet := make([]byte, 25)
+		if _, err := reader.Read(packet); err != nil {
+			return nil, err
+		}
+
+		avl, err := parseAVLPacket(packet)
+		if err != nil {
+			continue
+		}
+		records = append(records, avl)
+	}
+
+	return records, nil
+}
+
+// --- Parse a single AVL packet ---
+func parseAVLPacket(data []byte) (*AVLData, error) {
+	if len(data) < 25 {
+		return nil, fmt.Errorf("packet too short")
+	}
+
+	timestampMs := binary.BigEndian.Uint64(data[0:8])
+	timestamp := time.UnixMilli(int64(timestampMs))
+
+	lon := int32(binary.BigEndian.Uint32(data[9:13]))
+	lat := int32(binary.BigEndian.Uint32(data[13:17]))
+	alt := int(binary.BigEndian.Uint16(data[17:19]))
+	angle := int(binary.BigEndian.Uint16(data[19:21]))
+	sat := int(data[21])
+	speed := int(binary.BigEndian.Uint16(data[22:24]))
+
+	return &AVLData{
+		Timestamp:  timestamp,
+		Latitude:   float64(lat) / 1e7,
+		Longitude:  float64(lon) / 1e7,
+		Altitude:   alt,
+		Angle:      angle,
+		Satellites: sat,
+		Speed:      speed,
+	}, nil
+}
+
+// --- Batch insert positions into PostgreSQL ---
+func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 
-	// Step 2: connect to TCP server
-	conn, err := net.Dial("tcp", tcpServerHost)
+	stmt, err := tx.Prepare(`
+		INSERT INTO positions (device_id, imei, timestamp, latitude, longitude, speed, angle, altitude, satellites)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+	`)
 	if err != nil {
-		return fmt.Errorf("failed to connect to TCP server: %v", err)
+		return err
 	}
-	defer conn.Close()
-	log.Println("✅ Connected to TCP server")
+	defer stmt.Close()
 
-	for _, imei := range imeis {
-		// Send IMEI
-		conn.Write(buildImeiPacket(imei))
-
-		// Read ACK
-		ack := make([]byte, 1)
-		if _, err := conn.Read(ack); err != nil {
-			return fmt.Errorf("failed to read IMEI ACK: %v", err)
-		}
-		if ack[0] != 0x01 {
-			return fmt.Errorf("IMEI not acknowledged: %s", imei)
-		}
-		log.Printf("📡 IMEI acknowledged for %s", imei)
-
-		// Send AVL packet
-		lat, lon := randomLatLon() // optionally random for simulation
-		alt, angle, sat, speed := 12, 180, 8, 45
-		conn.Write(buildAvlPacket(lat, lon, alt, angle, sat, speed))
-
-		// Read server ACK
-		resp := make([]byte, 4)
-		if _, err := conn.Read(resp); err != nil {
-			return fmt.Errorf("failed to read AVL ACK: %v", err)
-		}
-		log.Printf("📤 Server response ACK for %s: %x", imei, resp)
-
-		// Step 3: Send position to backend
-		pos := Position{
-			DeviceID:  devicesMap[imei],
-			Latitude:  lat,
-			Longitude: lon,
-			Altitude:  alt,
-			Angle:     angle,
-			Speed:     speed,
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-		}
-		if err := postPosition(pos); err != nil {
-			log.Printf("❌ Failed to send position for %s: %v", imei, err)
-		} else {
-			log.Printf("📥 Position sent to backend for %s", imei)
-		}
-
-		// Optional: GET latest position from backend
-		latest, err := getLatestPosition(imei)
-		if err != nil {
-			log.Printf("❌ Failed to fetch latest position for %s: %v", imei, err)
-		} else {
-			log.Printf("📍 Latest backend position for %s: %+v", imei, latest)
+	for _, avl := range records {
+		if _, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites); err != nil {
+			log.Println("⚠️ Failed insert:", err)
 		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
-// ensureDevices creates devices if missing, returns map[imei]deviceID
-func ensureDevices(imeis []string) (map[string]int, error) {
-	devicesMap := make(map[string]int)
-
-	// GET existing devices
-	resp, err := http.Get(devicesListURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to GET devices list: %v", err)
+// --- Forward batch to backend ---
+func postPositionsToBackend(positions []map[string]interface{}) error {
+	if len(positions) == 0 {
+		return nil
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var existing []Device
-	if err := json.Unmarshal(body, &existing); err != nil {
-		return nil, fmt.Errorf("failed to parse devices list: %v", err)
-	}
-	for _, d := range existing {
-		devicesMap[d.IMEI] = d.ID
-	}
-
-	// Create missing devices
-	for _, imei := range imeis {
-		if _, exists := devicesMap[imei]; exists {
-			log.Printf("📥 Device %s already exists (duplicate key ignored)", imei)
-			continue
-		}
-
-		data, _ := json.Marshal(map[string]string{"imei": imei})
-		req, _ := http.NewRequest("POST", devicesPostURL, bytes.NewBuffer(data))
-		req.Header.Set("Content-Type", "application/json")
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("❌ Failed to create device %s: %v", imei, err)
-			continue
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		var newDevice Device
-		if err := json.Unmarshal(respBody, &newDevice); err != nil {
-			log.Printf("❌ Failed to parse device creation response for %s: %s", imei, string(respBody))
-			continue
-		}
-		devicesMap[imei] = newDevice.ID
-		log.Printf("📥 Device %s created on backend", imei)
-	}
-
-	return devicesMap, nil
-}
-
-func buildImeiPacket(imei string) []byte {
-	buf := make([]byte, 1+len(imei))
-	buf[0] = byte(len(imei))
-	copy(buf[1:], []byte(imei))
-	return buf
-}
-
-func buildAvlPacket(lat, lon float64, alt, angle, sat, speed int) []byte {
-	buf := make([]byte, 45)
-	offset := 0
-
-	binary.BigEndian.PutUint32(buf[offset:], 0)
-	offset += 4
-	binary.BigEndian.PutUint32(buf[offset:], 0)
-	offset += 4
-	buf[offset] = 0x08
-	offset++
-	buf[offset] = 0x01
-	offset++
-
-	binary.BigEndian.PutUint64(buf[offset:], uint64(time.Now().UnixNano()/1e6))
-	offset += 8
-	buf[offset] = 0
-	offset++
-
-	binary.BigEndian.PutUint32(buf[offset:], uint32(int32(lon*1e7)))
-	offset += 4
-	binary.BigEndian.PutUint32(buf[offset:], uint32(int32(lat*1e7)))
-	offset += 4
-
-	binary.BigEndian.PutUint16(buf[offset:], uint16(alt))
-	offset += 2
-	binary.BigEndian.PutUint16(buf[offset:], uint16(angle))
-	offset += 2
-	buf[offset] = byte(sat)
-	offset++
-	binary.BigEndian.PutUint16(buf[offset:], uint16(speed))
-	offset++
-	buf[offset] = 0
-	offset++
-	buf[offset] = 0
-	offset++
-
-	for i := offset; i < len(buf); i++ {
-		buf[i] = 0
-	}
-
-	return buf
-}
-
-func postPosition(pos Position) error {
-	data, _ := json.Marshal(pos)
-	req, _ := http.NewRequest("POST", positionsPostURL, bytes.NewBuffer(data))
+	data, _ := json.Marshal(positions)
+	req, _ := http.NewRequest("POST", backendTrackURL, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("HTTP POST failed: %v", err)
+		return err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	log.Printf("📬 HTTP response: %s", string(body))
+	log.Printf("📬 Backend response: %s", string(body))
 	return nil
 }
 
-// getLatestPosition fetches latest position for a device by IMEI
-func getLatestPosition(imei string) (*Position, error) {
-	resp, err := http.Get(deviceLatestURL + imei)
-	if err != nil {
-		return nil, err
+// --- Helpers ---
+func getEnv(key, fallback string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
 	}
-	defer resp.Body.Close()
-
-	var latest Position
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &latest); err != nil {
-		return nil, fmt.Errorf("failed to parse latest position: %s", string(body))
-	}
-	return &latest, nil
-}
-
-// Optional: simulate random positions (slight movement)
-func randomLatLon() (float64, float64) {
-	baseLat, baseLon := -1.30345, 36.81234
-	return baseLat + (0.001 * float64(time.Now().UnixNano()%10)), baseLon + (0.001 * float64(time.Now().UnixNano()%10))
+	return fallback
 }
