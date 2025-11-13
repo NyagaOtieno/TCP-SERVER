@@ -164,14 +164,12 @@ func readIMEI(conn net.Conn) (string, error) {
 
 // --- Ensure device exists via backend list ---
 func ensureDevice(imei string) (int, error) {
-	// Check PostgreSQL cache first
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
 
-	// Fetch devices list from backend
 	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
 	if err != nil {
 		return 0, fmt.Errorf("failed to GET devices list: %v", err)
@@ -189,7 +187,6 @@ func ensureDevice(imei string) (int, error) {
 
 	for _, d := range devices {
 		if d.IMEI == imei {
-			// Cache device in PostgreSQL
 			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
 			return d.ID, nil
 		}
@@ -203,7 +200,7 @@ func parseAVLRecords(data []byte) ([]*AVLData, error) {
 	var records []*AVLData
 	reader := bytes.NewReader(data)
 
-	for reader.Len() >= 25 { // Minimum packet size
+	for reader.Len() >= 25 {
 		packet := make([]byte, 25)
 		if _, err := reader.Read(packet); err != nil {
 			return nil, err
@@ -228,17 +225,24 @@ func parseAVLPacket(data []byte) (*AVLData, error) {
 	timestampMs := binary.BigEndian.Uint64(data[0:8])
 	timestamp := time.UnixMilli(int64(timestampMs))
 
-	lon := int32(binary.BigEndian.Uint32(data[9:13]))
-	lat := int32(binary.BigEndian.Uint32(data[13:17]))
+	latRaw := int32(binary.BigEndian.Uint32(data[9:13]))
+	lonRaw := int32(binary.BigEndian.Uint32(data[13:17]))
 	alt := int(binary.BigEndian.Uint16(data[17:19]))
 	angle := int(binary.BigEndian.Uint16(data[19:21]))
 	sat := int(data[21])
 	speed := int(binary.BigEndian.Uint16(data[22:24]))
 
+	latitude := float64(latRaw) / 1e7
+	longitude := float64(lonRaw) / 1e7
+
+	if latitude == 0 || longitude == 0 {
+		return nil, fmt.Errorf("invalid coordinates")
+	}
+
 	return &AVLData{
 		Timestamp:  timestamp,
-		Latitude:   float64(lat) / 1e7,
-		Longitude:  float64(lon) / 1e7,
+		Latitude:   latitude,
+		Longitude:  longitude,
 		Altitude:   alt,
 		Angle:      angle,
 		Satellites: sat,
@@ -267,6 +271,10 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer stmt.Close()
 
 	for _, avl := range records {
+		if avl.Latitude == 0 || avl.Longitude == 0 {
+			log.Println("⚠️ Skipping invalid coordinates:", avl)
+			continue
+		}
 		if _, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites); err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
