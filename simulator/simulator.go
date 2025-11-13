@@ -1,38 +1,39 @@
 package main
 
 import (
-    "encoding/hex"
-    "fmt"
-    "net"
-    "time"
+	"encoding/hex"
+	"fmt"
+	"math/rand"
+	"net"
+	"time"
 )
 
+// Run simulator only when executed explicitly
 func main() {
-    serverAddr := "switchback.proxy.rlwy.net:15376"
+	serverAddr := "switchback.proxy.rlwy.net:15376"
 
-    packets := []string{
-        "000F31323334353637383930313233343508010000016635F7FBC02A520B00C8000B0F0700000000010002",
-        "000F31323334353637383930313233343508010000016635F7FBC02A521B00C9000B0F0800000000010002",
-        "000F31323334353637383930313233343508010000016635F7FBC02A522B00CA000B0F0900000000010002",
-    }
+	baseLat := -1.2921
+	baseLng := 36.8219
 
-    conn, err := net.Dial("tcp", serverAddr)
-    if err != nil {
-        panic(err)
-    }
-    defer conn.Close()
+	for i := 0; i < 5; i++ { // send 5 packets
+		timestamp := time.Now().UnixMilli()
+		lat := baseLat + rand.Float64()*0.01
+		lng := baseLng + rand.Float64()*0.01
+		speed := rand.Intn(80)
 
-    for i, packetHex := range packets {
-        data, _ := hex.DecodeString(packetHex)
-        fmt.Printf("✅ Sending packet %d\n", i+1)
-        conn.Write(data)
+		// Build a fake AVL packet
+		packetHex := fmt.Sprintf("%016X0000000000000000%08X%08X%04X0000000000", timestamp, int(lng*1e7), int(lat*1e7), speed)
+		data, _ := hex.DecodeString(packetHex)
 
-        ack := make([]byte, 1)
-        conn.Read(ack)
-        fmt.Printf("📬 Server ACK: 0x%X\n", ack[0])
+		conn, err := net.Dial("tcp", serverAddr)
+		if err != nil {
+			panic(err)
+		}
+		defer conn.Close()
 
-        time.Sleep(1 * time.Second)
-    }
-
-    fmt.Println("✅ All simulated packets sent successfully.")
+		fmt.Println("✅ Connected, sending packet...")
+		conn.Write(data)
+		time.Sleep(1 * time.Second)
+		fmt.Printf("✅ Packet %d sent\n", i+1)
+	}
 }
