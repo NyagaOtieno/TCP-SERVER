@@ -42,9 +42,13 @@ func init() {
 	_ = godotenv.Load()
 
 	tcpServerHost = getEnv("TCP_SERVER_HOST", "0.0.0.0:5027")
-	backendTrackURL = getEnv("BACKEND_TRACK_URL", "http://localhost:8081/positions")
+	backendTrackURL = getEnv("BACKEND_TRACK_URL", "https://mytrack-production.up.railway.app/api/track")
 
-	pgURL := getEnv("POSTGRES_URL", "postgresql://postgres:password@localhost:5432/tracker?sslmode=disable")
+	pgURL := getEnv("DATABASE_URL", "")
+	if pgURL == "" {
+		log.Fatal("❌ DATABASE_URL not set")
+	}
+
 	var err error
 	db, err = sql.Open("postgres", pgURL)
 	if err != nil {
@@ -59,7 +63,7 @@ func init() {
 	if err = db.Ping(); err != nil {
 		log.Fatalf("❌ PostgreSQL ping failed: %v", err)
 	}
-	log.Println("✅ Configuration loaded, PostgreSQL connected")
+	log.Println("✅ PostgreSQL connected successfully")
 }
 
 func main() {
@@ -188,7 +192,7 @@ func readIMEI(conn net.Conn) (string, error) {
 	return imei, nil
 }
 
-// --- Ensure device exists ---
+// --- Ensure device exists in local DB or backend ---
 func ensureDevice(imei string) (int, error) {
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
@@ -251,13 +255,21 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 		// skip IO elements safely
 		var n1, n2, n4, n8 byte
 		binary.Read(reader, binary.BigEndian, &n1)
-		for j := 0; j < int(n1); j++ { reader.Seek(2, io.SeekCurrent) }
+		for j := 0; j < int(n1); j++ {
+			reader.Seek(2, io.SeekCurrent)
+		}
 		binary.Read(reader, binary.BigEndian, &n2)
-		for j := 0; j < int(n2); j++ { reader.Seek(3, io.SeekCurrent) }
+		for j := 0; j < int(n2); j++ {
+			reader.Seek(3, io.SeekCurrent)
+		}
 		binary.Read(reader, binary.BigEndian, &n4)
-		for j := 0; j < int(n4); j++ { reader.Seek(5, io.SeekCurrent) }
+		for j := 0; j < int(n4); j++ {
+			reader.Seek(5, io.SeekCurrent)
+		}
 		binary.Read(reader, binary.BigEndian, &n8)
-		for j := 0; j < int(n8); j++ { reader.Seek(9, io.SeekCurrent) }
+		for j := 0; j < int(n8); j++ {
+			reader.Seek(9, io.SeekCurrent)
+		}
 
 		ts := time.UnixMilli(int64(timestamp))
 		lat := float64(latRaw) / 1e7
@@ -277,7 +289,7 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	return records, nil
 }
 
-// --- Batch insert ---
+// --- Batch insert into PostgreSQL ---
 func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	if len(records) == 0 {
 		return nil
@@ -289,8 +301,8 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO positions (device_id, imei, timestamp, lat, lng, speed, angle, altitude, satellites)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		INSERT INTO positions (device_id, lat, lon, speed, angle, altitude, satellites, ts)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 	`)
 	if err != nil {
 		return err
@@ -298,7 +310,7 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer stmt.Close()
 
 	for _, avl := range records {
-		_, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites)
+		_, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp)
 		if err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
@@ -310,7 +322,7 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	return nil
 }
 
-// --- Forward to backend ---
+// --- Forward positions to backend ---
 func postPositionsToBackend(positions []map[string]interface{}) error {
 	if len(positions) == 0 {
 		return nil
