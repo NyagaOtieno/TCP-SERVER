@@ -36,7 +36,7 @@ type AVLData struct {
 	Speed      int
 }
 
-// --- Global config ---
+// Global configuration
 var (
 	tcpServerHost   string
 	backendTrackURL string
@@ -47,12 +47,10 @@ var (
 func init() {
 	_ = godotenv.Load()
 
-	tcpPort := getEnv("TCP_PORT", "5027")
-	tcpServerHost = ":" + tcpPort
+	tcpServerHost = getEnv("TCP_PORT", "5027")
 	backendTrackURL = getEnv("BACKEND_TRACK_URL", "https://mytrack-production.up.railway.app/api/track")
 
-	pgURL := fmt.Sprintf(
-		"postgres://%s:%s@%s:%s/%s?sslmode=require",
+	pgURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=require",
 		getEnv("DB_USER", "postgres"),
 		getEnv("DB_PASSWORD", ""),
 		getEnv("DB_HOST", "localhost"),
@@ -77,14 +75,13 @@ func init() {
 	log.Println("✅ Configuration loaded, PostgreSQL connected")
 }
 
-// --- Main ---
 func main() {
-	listener, err := net.Listen("tcp", tcpServerHost)
+	listener, err := net.Listen("tcp", ":"+tcpServerHost)
 	if err != nil {
 		log.Fatalf("❌ Failed to start TCP server: %v", err)
 	}
 	defer listener.Close()
-	log.Println("✅ TCP Server listening on", tcpServerHost)
+	log.Println("✅ TCP Server listening on port", tcpServerHost)
 
 	for {
 		conn, err := listener.Accept()
@@ -96,7 +93,7 @@ func main() {
 	}
 }
 
-// --- Handle incoming connection ---
+// Handle incoming device connection
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -113,11 +110,11 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Robust buffer handling
-	buf := make([]byte, 0)
-	tmp := make([]byte, 4096)
+	buf := make([]byte, 4096)
+	frameBuffer := make([]byte, 0)
+
 	for {
-		n, err := conn.Read(tmp)
+		n, err := conn.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("🔌 Read error for %s: %v", imei, err)
@@ -127,89 +124,90 @@ func handleConnection(conn net.Conn) {
 		if n == 0 {
 			continue
 		}
-		buf = append(buf, tmp[:n]...)
+
+		frameBuffer = append(frameBuffer, buf[:n]...)
 
 		for {
-			if len(buf) < 12 {
-				break
+			if len(frameBuffer) < 12 {
+				break // not enough for header
 			}
-			// check preamble
-			if !(buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0) {
-				buf = buf[1:]
+
+			// Check preamble (4 bytes zeros)
+			if frameBuffer[0] != 0 || frameBuffer[1] != 0 || frameBuffer[2] != 0 || frameBuffer[3] != 0 {
+				frameBuffer = frameBuffer[1:] // shift until preamble found
 				continue
 			}
 
-			dataLen := int(binary.BigEndian.Uint32(buf[4:8]))
+			dataLen := int(binary.BigEndian.Uint32(frameBuffer[4:8]))
 			frameEnd := 8 + dataLen + 4
-			if len(buf) < frameEnd {
-				break
+			if len(frameBuffer) < frameEnd {
+				break // incomplete frame
 			}
 
-			frame := buf[8 : 8+dataLen]
-			avlRecords, err := parseTeltonikaDataField(frame)
+			dataField := frameBuffer[8 : 8+dataLen]
+			avlRecords, err := parseTeltonikaDataField(dataField)
 			if err != nil {
 				log.Printf("❌ Failed to parse frame: %v", err)
-			} else {
-				if len(avlRecords) > 0 {
-					log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
-					if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
-						log.Printf("❌ Failed to store positions: %v", err)
-					}
-					var backendPayload []map[string]interface{}
-					for _, avl := range avlRecords {
-						backendPayload = append(backendPayload, map[string]interface{}{
-							"device_id":  deviceID,
-							"imei":       imei,
-							"timestamp":  avl.Timestamp.Format(time.RFC3339),
-							"latitude":   avl.Latitude,
-							"longitude":  avl.Longitude,
-							"speed":      avl.Speed,
-							"angle":      avl.Angle,
-							"altitude":   avl.Altitude,
-							"satellites": avl.Satellites,
-						})
-					}
-					if err := postPositionsToBackend(backendPayload); err != nil {
-						log.Printf("❌ Failed to forward to backend: %v", err)
-					}
+			} else if len(avlRecords) > 0 {
+				log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
+
+				if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
+					log.Printf("❌ Failed to store positions: %v", err)
+				}
+
+				backendPayload := make([]map[string]interface{}, 0, len(avlRecords))
+				for _, avl := range avlRecords {
+					backendPayload = append(backendPayload, map[string]interface{}{
+						"device_id":  deviceID,
+						"imei":       imei,
+						"timestamp":  avl.Timestamp.Format(time.RFC3339),
+						"lat":        avl.Latitude,
+						"lng":        avl.Longitude,
+						"speed":      avl.Speed,
+						"angle":      avl.Angle,
+						"altitude":   avl.Altitude,
+						"satellites": avl.Satellites,
+					})
+				}
+				if err := postPositionsToBackend(backendPayload); err != nil {
+					log.Printf("❌ Failed to forward to backend: %v", err)
 				}
 			}
 
 			conn.Write([]byte{0x01})
-			buf = buf[frameEnd:]
+			frameBuffer = frameBuffer[frameEnd:]
 		}
 	}
 }
 
-// --- Read IMEI ---
+// Read IMEI
 func readIMEI(conn net.Conn) (string, error) {
 	buf := make([]byte, 32)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return "", err
 	}
-	raw := string(buf[:n])
 	re := regexp.MustCompile(`\D`)
-	imei := re.ReplaceAllString(raw, "")
+	imei := re.ReplaceAllString(string(buf[:n]), "")
 	conn.Write([]byte{0x01})
-	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", raw, imei)
+	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", string(buf[:n]), imei)
 	return imei, nil
 }
 
-// --- Ensure device exists ---
+// Ensure device exists
 func ensureDevice(imei string) (int, error) {
-	imei = strings.TrimSpace(imei)
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
-	// fallback: query backend
-	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
+
+	resp, err := httpClient.Get(backendTrackURL + "/devices/list")
 	if err != nil {
 		return 0, fmt.Errorf("failed to GET devices list: %v", err)
 	}
 	defer resp.Body.Close()
+
 	body, _ := io.ReadAll(resp.Body)
 	var devices []struct {
 		ID   int    `json:"id"`
@@ -218,135 +216,115 @@ func ensureDevice(imei string) (int, error) {
 	if err := json.Unmarshal(body, &devices); err != nil {
 		return 0, fmt.Errorf("failed to parse devices list: %v\n%s", err, string(body))
 	}
+
 	for _, d := range devices {
 		if strings.TrimSpace(d.IMEI) == imei {
 			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
 			return d.ID, nil
 		}
 	}
-	return 0, fmt.Errorf("device IMEI %s not found", imei)
+
+	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
-// --- Parse Teltonika data field (Codec8/Extended) ---
+// Parse Teltonika Codec8 / Codec8 Extended
 func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
-		return nil, fmt.Errorf("data too short")
+		return nil, fmt.Errorf("data field too short")
 	}
-	r := bytes.NewReader(data)
-	var codec byte
-	if err := binary.Read(r, binary.BigEndian, &codec); err != nil {
+	reader := bytes.NewReader(data)
+	var codecID byte
+	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
 		return nil, err
 	}
+
 	var recordsCount byte
-	if err := binary.Read(r, binary.BigEndian, &recordsCount); err != nil {
+	if err := binary.Read(reader, binary.BigEndian, &recordsCount); err != nil {
 		return nil, err
 	}
+
 	records := make([]*AVLData, 0, recordsCount)
 	for i := 0; i < int(recordsCount); i++ {
-		var ts uint64
-		if err := binary.Read(r, binary.BigEndian, &ts); err != nil {
+		var timestamp uint64
+		if err := binary.Read(reader, binary.BigEndian, &timestamp); err != nil {
 			return nil, fmt.Errorf("failed to read timestamp: %v", err)
 		}
 		var priority byte
-		if err := binary.Read(r, binary.BigEndian, &priority); err != nil {
+		if err := binary.Read(reader, binary.BigEndian, &priority); err != nil {
 			return nil, err
 		}
-		var lonRaw int32
-		var latRaw int32
-		var altitude uint16
-		var angle uint16
-		var sats byte
+		var lonRaw, latRaw int32
+		binary.Read(reader, binary.BigEndian, &lonRaw)
+		binary.Read(reader, binary.BigEndian, &latRaw)
+		var altitude, angle uint16
+		binary.Read(reader, binary.BigEndian, &altitude)
+		binary.Read(reader, binary.BigEndian, &angle)
+		var satellites byte
+		binary.Read(reader, binary.BigEndian, &satellites)
 		var speed uint16
-		if err := binary.Read(r, binary.BigEndian, &lonRaw); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(r, binary.BigEndian, &latRaw); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(r, binary.BigEndian, &altitude); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(r, binary.BigEndian, &angle); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(r, binary.BigEndian, &sats); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(r, binary.BigEndian, &speed); err != nil {
-			return nil, err
-		}
+		binary.Read(reader, binary.BigEndian, &speed)
 
-		// Read N1, N2, N4, N8 counts
+		// Read IO counts (N1/N2/N4/N8)
 		var n1 byte
-		if err := binary.Read(r, binary.BigEndian, &n1); err != nil {
+		if err := binary.Read(reader, binary.BigEndian, &n1); err != nil {
 			return nil, fmt.Errorf("failed to read IO count: %v", err)
 		}
 		for j := 0; j < int(n1); j++ {
 			var id, val byte
-			binary.Read(r, binary.BigEndian, &id)
-			binary.Read(r, binary.BigEndian, &val)
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
 		var n2, n4, n8 byte
-		binary.Read(r, binary.BigEndian, &n2)
+		binary.Read(reader, binary.BigEndian, &n2)
 		for j := 0; j < int(n2); j++ {
 			var id byte
 			var val uint16
-			binary.Read(r, binary.BigEndian, &id)
-			binary.Read(r, binary.BigEndian, &val)
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
-		binary.Read(r, binary.BigEndian, &n4)
+		binary.Read(reader, binary.BigEndian, &n4)
 		for j := 0; j < int(n4); j++ {
 			var id byte
 			var val uint32
-			binary.Read(r, binary.BigEndian, &id)
-			binary.Read(r, binary.BigEndian, &val)
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
-		binary.Read(r, binary.BigEndian, &n8)
+		binary.Read(reader, binary.BigEndian, &n8)
 		for j := 0; j < int(n8); j++ {
 			var id byte
 			var val uint64
-			binary.Read(r, binary.BigEndian, &id)
-			binary.Read(r, binary.BigEndian, &val)
-		}
-
-		lat := float64(latRaw) / 1e7
-		lon := float64(lonRaw) / 1e7
-		if lat < -90 || lat > 90 {
-			lat = 0
-		}
-		if lon < -180 || lon > 180 {
-			lon = 0
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
 
 		records = append(records, &AVLData{
-			Timestamp:  time.UnixMilli(int64(ts)),
-			Latitude:   lat,
-			Longitude:  lon,
+			Timestamp:  time.UnixMilli(int64(timestamp)),
+			Latitude:   float64(latRaw) / 1e7,
+			Longitude:  float64(lonRaw) / 1e7,
 			Altitude:   int(altitude),
 			Angle:      int(angle),
-			Satellites: int(sats),
+			Satellites: int(satellites),
 			Speed:      int(speed),
 		})
 	}
 	var numberOfData2 byte
-	binary.Read(r, binary.BigEndian, &numberOfData2)
+	binary.Read(reader, binary.BigEndian, &numberOfData2)
+
 	return records, nil
 }
 
-// --- Store positions ---
+// Insert positions into PostgreSQL
 func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	if len(records) == 0 {
 		return nil
 	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if !tx.Stmt(nil) {
-			_ = tx.Rollback()
-		}
-	}()
+	defer tx.Rollback()
+
 	stmt, err := tx.Prepare(`
 		INSERT INTO positions (device_id, imei, timestamp, lat, lng, speed, angle, altitude, satellites)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -355,16 +333,17 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 		return err
 	}
 	defer stmt.Close()
+
 	for _, avl := range records {
-		_, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites)
-		if err != nil {
+		if _, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites); err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
 	}
+
 	return tx.Commit()
 }
 
-// --- Forward to backend ---
+// Forward positions to backend
 func postPositionsToBackend(positions []map[string]interface{}) error {
 	if len(positions) == 0 {
 		return nil
@@ -382,7 +361,7 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 	return nil
 }
 
-// --- Helpers ---
+// Helper
 func getEnv(key, fallback string) string {
 	if val, ok := os.LookupEnv(key); ok {
 		return val
