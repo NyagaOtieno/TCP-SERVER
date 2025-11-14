@@ -19,11 +19,10 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// AVLData represents a parsed FMB920 AVL packet
+// AVLData represents a parsed FMB920 AVL packet without longitude
 type AVLData struct {
 	Timestamp  time.Time
 	Latitude   float64
-	Longitude  float64
 	Altitude   int
 	Angle      int
 	Satellites int
@@ -55,7 +54,6 @@ func init() {
 		log.Fatalf("❌ Failed to connect to PostgreSQL: %v", err)
 	}
 
-	// connection pool
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -123,7 +121,6 @@ func handleConnection(conn net.Conn) {
 				break
 			}
 
-			// Find preamble 0x00 0x00 0x00 0x00
 			if !(data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 && data[offset+3] == 0) {
 				offset++
 				continue
@@ -158,7 +155,6 @@ func handleConnection(conn net.Conn) {
 						"imei":       imei,
 						"timestamp":  avl.Timestamp.Format(time.RFC3339),
 						"latitude":   avl.Latitude,
-						"longitude":  avl.Longitude,
 						"speed":      avl.Speed,
 						"angle":      avl.Angle,
 						"altitude":   avl.Altitude,
@@ -192,7 +188,7 @@ func readIMEI(conn net.Conn) (string, error) {
 	return imei, nil
 }
 
-// --- Ensure device exists in local DB or backend ---
+// --- Ensure device exists ---
 func ensureDevice(imei string) (int, error) {
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
@@ -224,7 +220,7 @@ func ensureDevice(imei string) (int, error) {
 	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
-// --- Parse Teltonika Codec8 / Codec8 Extended ---
+// --- Parse Teltonika Codec8 / Codec8 Extended (without longitude) ---
 func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("data field too short")
@@ -239,20 +235,19 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	for i := 0; i < int(recordsCount); i++ {
 		var timestamp uint64
 		var priority byte
-		var lonRaw, latRaw int32
+		var latRaw int32
 		var alt, angle, speed uint16
 		var satellites byte
 
 		binary.Read(reader, binary.BigEndian, &timestamp)
 		binary.Read(reader, binary.BigEndian, &priority)
-		binary.Read(reader, binary.BigEndian, &lonRaw)
 		binary.Read(reader, binary.BigEndian, &latRaw)
 		binary.Read(reader, binary.BigEndian, &alt)
 		binary.Read(reader, binary.BigEndian, &angle)
 		binary.Read(reader, binary.BigEndian, &satellites)
 		binary.Read(reader, binary.BigEndian, &speed)
 
-		// skip IO elements safely
+		// skip IO elements
 		var n1, n2, n4, n8 byte
 		binary.Read(reader, binary.BigEndian, &n1)
 		for j := 0; j < int(n1); j++ {
@@ -271,14 +266,9 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 			reader.Seek(9, io.SeekCurrent)
 		}
 
-		ts := time.UnixMilli(int64(timestamp))
-		lat := float64(latRaw) / 1e7
-		lon := float64(lonRaw) / 1e7
-
 		records = append(records, &AVLData{
-			Timestamp:  ts,
-			Latitude:   lat,
-			Longitude:  lon,
+			Timestamp:  time.UnixMilli(int64(timestamp)),
+			Latitude:   float64(latRaw) / 1e7,
 			Altitude:   int(alt),
 			Angle:      int(angle),
 			Satellites: int(satellites),
@@ -301,7 +291,7 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO positions (device_id, lat, lon, speed, angle, altitude, satellites, ts)
+		INSERT INTO positions (device_id, lat, speed, angle, altitude, satellites, timestamp, imei)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 	`)
 	if err != nil {
@@ -310,7 +300,7 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer stmt.Close()
 
 	for _, avl := range records {
-		_, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp)
+		_, err := stmt.Exec(deviceID, avl.Latitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei)
 		if err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
