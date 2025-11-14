@@ -63,6 +63,11 @@ func init() {
 		log.Fatalf("❌ Failed to connect to PostgreSQL: %v", err)
 	}
 
+	// Set sensible connection pool limits to avoid "too many clients" errors
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	if err = db.Ping(); err != nil {
 		log.Fatalf("❌ PostgreSQL ping failed: %v", err)
 	}
@@ -87,6 +92,11 @@ func main() {
 		}
 		go handleConnection(conn)
 	}
+}
+
+// dumpHex prints raw packet bytes in hex for debugging
+func dumpHex(label string, data []byte) {
+	log.Printf("%s [%d bytes]: %X", label, len(data), data)
 }
 
 // --- Handle incoming device connection ---
@@ -116,6 +126,9 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
+		// Debug: show raw packet bytes
+		dumpHex("📦 RAW PACKET RECEIVED", data[:n])
+
 		avlRecords, err := parseAVLRecords(data[:n])
 		if err != nil {
 			log.Printf("❌ Failed to parse AVL for %s: %v", imei, err)
@@ -125,6 +138,8 @@ func handleConnection(conn net.Conn) {
 		if len(avlRecords) == 0 {
 			continue
 		}
+
+		log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
 
 		if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
 			log.Printf("❌ Failed to store batch positions: %v", err)
@@ -173,6 +188,9 @@ func readIMEI(conn net.Conn) (string, error) {
 	imei = strings.Trim(imei, "\x00\x0F")
 	re := regexp.MustCompile(`\D`)
 	imei = re.ReplaceAllString(imei, "")
+
+	// Log raw and cleaned IMEI for debugging
+	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", string(buf[1:n]), imei)
 
 	return imei, nil
 }
@@ -231,6 +249,9 @@ func parseAVLRecords(data []byte) ([]*AVLData, error) {
 			return nil, err
 		}
 
+		// Log the per-packet bytes too (optional)
+		dumpHex("📦 AVL PACKET", packet)
+
 		avl, err := parseAVLPacket(packet)
 		if err != nil {
 			continue
@@ -265,6 +286,17 @@ func parseAVLPacket(data []byte) (*AVLData, error) {
 	sat := int(data[20])
 	speed := int(binary.BigEndian.Uint16(data[21:23]))
 
+	// Log parsed values for debugging
+	log.Printf("📍 Parsed AVL: ts=%s lat=%f lon=%f speed=%d sat=%d angle=%d alt=%d",
+		timestamp.Format(time.RFC3339),
+		float64(lat)/1e7,
+		float64(lon)/1e7,
+		speed,
+		sat,
+		angle,
+		alt,
+	)
+
 	return &AVLData{
 		Timestamp:  timestamp,
 		Latitude:   float64(lat) / 1e7,
@@ -287,6 +319,14 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 		return err
 	}
 
+	// Ensure rollback on error
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
 	stmt, err := tx.Prepare(`
 		INSERT INTO positions (device_id, imei, timestamp, latitude, longitude, speed, angle, altitude, satellites)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -302,7 +342,11 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // --- Forward batch to backend ---
