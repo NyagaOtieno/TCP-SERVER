@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -165,11 +167,24 @@ func readIMEI(conn net.Conn) (string, error) {
 	}
 	imei := string(buf[1:n])
 	conn.Write([]byte{0x01}) // ACK
+
+	// Clean IMEI: remove whitespace, control chars, keep only digits
+	imei = strings.TrimSpace(imei)
+	imei = strings.Trim(imei, "\x00\x0F")
+	re := regexp.MustCompile(`\D`)
+	imei = re.ReplaceAllString(imei, "")
+
 	return imei, nil
 }
 
 // --- Ensure device exists via backend list ---
 func ensureDevice(imei string) (int, error) {
+	// Clean IMEI just in case
+	imei = strings.TrimSpace(imei)
+	imei = strings.Trim(imei, "\x00\x0F")
+	re := regexp.MustCompile(`\D`)
+	imei = re.ReplaceAllString(imei, "")
+
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
 	if err == nil {
@@ -192,7 +207,11 @@ func ensureDevice(imei string) (int, error) {
 	}
 
 	for _, d := range devices {
-		if d.IMEI == imei {
+		// Clean backend IMEI for safe comparison
+		cleanIMEI := strings.TrimSpace(d.IMEI)
+		cleanIMEI = strings.Trim(cleanIMEI, "\x00\x0F")
+		cleanIMEI = re.ReplaceAllString(cleanIMEI, "")
+		if cleanIMEI == imei {
 			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
 			return d.ID, nil
 		}
