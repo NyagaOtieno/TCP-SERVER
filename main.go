@@ -34,14 +34,7 @@ type AVLData struct {
 	Angle      int
 	Satellites int
 	Speed      int
-	// RawIO optional if you want the IO map (kept out to avoid large types)
 }
-
-// Default fallback coordinates (Bermuda Triangle midpoint)
-const (
-	defaultLat = 25.0000
-	defaultLon = -71.0000
-)
 
 // --- Global config ---
 var (
@@ -64,7 +57,6 @@ func init() {
 		log.Fatalf("❌ Failed to connect to PostgreSQL: %v", err)
 	}
 
-	// Set sensible connection pool limits to avoid "too many clients" errors
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -76,7 +68,6 @@ func init() {
 	log.Println("✅ Configuration loaded, PostgreSQL connected")
 }
 
-// --- Main ---
 func main() {
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
@@ -117,122 +108,79 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Keep reading frames (Teltonika frames can be concatenated, ensure we process all bytes)
-	buf := make([]byte, 4096)
 	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("🔌 Read error for %s: %v", imei, err)
-			}
+		// Step 1: Read 4-byte length header
+		lenBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			log.Println("⚠️ Failed to read packet length:", err)
 			return
 		}
-		if n == 0 {
+		packetLength := int(binary.BigEndian.Uint32(lenBuf))
+
+		// Step 2: Read the full packet
+		packet := make([]byte, packetLength)
+		if _, err := io.ReadFull(conn, packet); err != nil {
+			log.Println("⚠️ Failed to read full packet:", err)
+			return
+		}
+
+		dumpHex("📦 RAW PACKET RECEIVED", packet)
+
+		// Step 3: Parse Teltonika Codec8/Codec8 Extended
+		avlRecords, err := parseTeltonikaDataField(packet)
+		if err != nil {
+			log.Printf("❌ Failed to parse Teltonika frame: %v", err)
 			continue
 		}
 
-		data := make([]byte, n)
-		copy(data, buf[:n])
+		if len(avlRecords) > 0 {
+			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
 
-		// Debug: show raw packet bytes
-		dumpHex("📦 RAW PACKET RECEIVED", data)
-
-		// Parse possibly multiple TL frames inside data
-		offset := 0
-		for offset < len(data) {
-			// Need at least 12 bytes for the Teltonika header (4 zeros + 4 length + 1 codec + 1 numRecords + trailing numRecords2 + CRC(4))
-			// But we will attempt to parse as much as available
-			if len(data[offset:]) < 11 {
-				// not enough bytes for a header — wait for more data in next read
-				break
+			if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
+				log.Printf("❌ Failed to store batch positions: %v", err)
 			}
 
-			// Expect four zero bytes (preamble)
-			if !(data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 && data[offset+3] == 0) {
-				// If preamble not found at offset, try advance by 1 to find frame start
-				offset++
-				continue
+			// Forward all records to backend
+			var backendPayload []map[string]interface{}
+			for _, avl := range avlRecords {
+				backendPayload = append(backendPayload, map[string]interface{}{
+					"device_id":  deviceID,
+					"imei":       imei,
+					"timestamp":  avl.Timestamp.Format(time.RFC3339),
+					"latitude":   avl.Latitude,
+					"longitude":  avl.Longitude,
+					"speed":      avl.Speed,
+					"angle":      avl.Angle,
+					"altitude":   avl.Altitude,
+					"satellites": avl.Satellites,
+				})
 			}
-
-			// Read data length (4 bytes big endian)
-			if offset+8 > len(data) {
-				break // wait for more bytes
-			}
-			dataLen := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
-			frameEnd := offset + 8 + dataLen + 4 // +4 for CRC
-			if frameEnd > len(data) {
-				// frame not fully received yet
-				break
-			}
-
-			// Slice data field (from codec id to Number of Data 2)
-			dataField := data[offset+8 : offset+8+dataLen]
-
-			// Parse the Teltonika AVL data field (Codec8 / Codec8 Extended)
-			avlRecords, err := parseTeltonikaDataField(dataField)
-			if err != nil {
-				log.Printf("❌ Failed to parse Teltonika frame: %v", err)
+			if err := postPositionsToBackend(backendPayload); err != nil {
+				log.Printf("❌ Failed to forward to backend: %v", err)
 			} else {
-				if len(avlRecords) > 0 {
-					log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
-
-					// store and forward
-					if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
-						log.Printf("❌ Failed to store batch positions: %v", err)
-					} else {
-						log.Printf("📍 %d positions saved for %s", len(avlRecords), imei)
-					}
-
-					// Forward all records to backend
-					var backendPayload []map[string]interface{}
-					for _, avl := range avlRecords {
-						backendPayload = append(backendPayload, map[string]interface{}{
-							"device_id":  deviceID,
-							"imei":       imei,
-							"timestamp":  avl.Timestamp.Format(time.RFC3339),
-							"latitude":   avl.Latitude,
-							"longitude":  avl.Longitude,
-							"speed":      avl.Speed,
-							"angle":      avl.Angle,
-							"altitude":   avl.Altitude,
-							"satellites": avl.Satellites,
-						})
-					}
-					if err := postPositionsToBackend(backendPayload); err != nil {
-						log.Printf("❌ Failed to forward to backend: %v", err)
-					} else {
-						log.Printf("📤 %d positions forwarded to backend for %s", len(avlRecords), imei)
-					}
-				}
+				log.Printf("📤 %d positions forwarded to backend for %s", len(avlRecords), imei)
 			}
-
-			// Send ACK to device for the full frame (Teltonika expects a 1 byte 0x01 after processing)
-			conn.Write([]byte{0x01})
-
-			// advance offset to next possible frame
-			offset = frameEnd
 		}
+
+		// Step 4: Send ACK
+		conn.Write([]byte{0x01})
 	}
 }
 
 // --- Read IMEI ---
 func readIMEI(conn net.Conn) (string, error) {
-	// IMEI sent as ASCII ending with 0x0D 0x0A or as bytes - read upto 32 bytes
 	buf := make([]byte, 32)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return "", err
 	}
-	// Many Teltonika devices send ASCII IMEI - sometimes prefixed by 0x0F — be robust
+
 	imeiRaw := string(buf[:n])
-	// Trim non-digit chars, keep only digits
 	re := regexp.MustCompile(`\D`)
 	imei := re.ReplaceAllString(imeiRaw, "")
 
-	// respond with ACK as Teltonika expects (0x01)
 	conn.Write([]byte{0x01})
 
-	// Log raw and cleaned IMEI for debugging
 	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", imeiRaw, imei)
 	return imei, nil
 }
@@ -263,8 +211,7 @@ func ensureDevice(imei string) (int, error) {
 	}
 
 	for _, d := range devices {
-		cleanIMEI := strings.TrimSpace(d.IMEI)
-		if cleanIMEI == imei {
+		if strings.TrimSpace(d.IMEI) == imei {
 			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
 			return d.ID, nil
 		}
@@ -273,9 +220,8 @@ func ensureDevice(imei string) (int, error) {
 	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
-// --- Parse Teltonika data field (Codec8/Codec8 Extended) ---
+// --- Parse Teltonika Codec8/Codec8 Extended data field ---
 func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
-	// data: starts with codecID, numberOfData(1), then N records, then numberOfData2 (1)
 	if len(data) < 2 {
 		return nil, fmt.Errorf("data field too short")
 	}
@@ -284,7 +230,6 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
 		return nil, err
 	}
-	// number of records (1 byte)
 	var recordsCount byte
 	if err := binary.Read(reader, binary.BigEndian, &recordsCount); err != nil {
 		return nil, err
@@ -293,20 +238,15 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	records := make([]*AVLData, 0, recordsCount)
 
 	for i := 0; i < int(recordsCount); i++ {
-		// Each record:
-		// Timestamp (8), Priority(1), Longitude(4), Latitude(4), Altitude(2),
-		// Angle(2), Satellites(1), Speed(2), IO elements (variable)
 		var timestamp uint64
 		if err := binary.Read(reader, binary.BigEndian, &timestamp); err != nil {
 			return nil, fmt.Errorf("failed to read timestamp: %v", err)
 		}
-		// priority - skip for now
 		var priority byte
 		if err := binary.Read(reader, binary.BigEndian, &priority); err != nil {
 			return nil, fmt.Errorf("failed to read priority: %v", err)
 		}
 
-		// longitude & latitude are 4-byte signed ints (1e-7)
 		var lonRaw int32
 		if err := binary.Read(reader, binary.BigEndian, &lonRaw); err != nil {
 			return nil, fmt.Errorf("failed to read lon: %v", err)
@@ -332,95 +272,38 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 			return nil, fmt.Errorf("failed to read speed: %v", err)
 		}
 
-		// Parse IO elements:
-		// Codec8 uses grouped IO counts: N1, N2, N4, N8 (each 1 byte)
-		// For Codec8 Extended the structure is the same but certain IO ids/lengths
-		// might be larger — we'll support N1/N2/N4/N8 and (optionally) NX if present.
-		var n1 byte
-		if err := binary.Read(reader, binary.BigEndian, &n1); err != nil {
-			return nil, fmt.Errorf("failed to read N1: %v", err)
-		}
-		// N1 entries (id:1 byte, value:1 byte)
+		var n1, n2, n4, n8 byte
+		binary.Read(reader, binary.BigEndian, &n1)
 		for j := 0; j < int(n1); j++ {
-			var id byte
-			var val byte
-			if err := binary.Read(reader, binary.BigEndian, &id); err != nil {
-				return nil, fmt.Errorf("failed N1 id: %v", err)
-			}
-			if err := binary.Read(reader, binary.BigEndian, &val); err != nil {
-				return nil, fmt.Errorf("failed N1 val: %v", err)
-			}
-			// optional: log.Printf("IO1 id=%d val=%d", id, val)
-			_ = id
-			_ = val
+			var id, val byte
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
-
-		// N2 entries (id:1 byte, value:2 bytes)
-		var n2 byte
-		if err := binary.Read(reader, binary.BigEndian, &n2); err != nil {
-			return nil, fmt.Errorf("failed to read N2: %v", err)
-		}
+		binary.Read(reader, binary.BigEndian, &n2)
 		for j := 0; j < int(n2); j++ {
 			var id byte
 			var val uint16
-			if err := binary.Read(reader, binary.BigEndian, &id); err != nil {
-				return nil, fmt.Errorf("failed N2 id: %v", err)
-			}
-			if err := binary.Read(reader, binary.BigEndian, &val); err != nil {
-				return nil, fmt.Errorf("failed N2 val: %v", err)
-			}
-			_ = id
-			_ = val
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
-
-		// N4 entries (id:1 byte, value:4 bytes)
-		var n4 byte
-		if err := binary.Read(reader, binary.BigEndian, &n4); err != nil {
-			return nil, fmt.Errorf("failed to read N4: %v", err)
-		}
+		binary.Read(reader, binary.BigEndian, &n4)
 		for j := 0; j < int(n4); j++ {
 			var id byte
 			var val uint32
-			if err := binary.Read(reader, binary.BigEndian, &id); err != nil {
-				return nil, fmt.Errorf("failed N4 id: %v", err)
-			}
-			if err := binary.Read(reader, binary.BigEndian, &val); err != nil {
-				return nil, fmt.Errorf("failed N4 val: %v", err)
-			}
-			_ = id
-			_ = val
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
-
-		// N8 entries (id:1 byte, value:8 bytes)
-		var n8 byte
-		if err := binary.Read(reader, binary.BigEndian, &n8); err != nil {
-			return nil, fmt.Errorf("failed to read N8: %v", err)
-		}
+		binary.Read(reader, binary.BigEndian, &n8)
 		for j := 0; j < int(n8); j++ {
 			var id byte
 			var val uint64
-			if err := binary.Read(reader, binary.BigEndian, &id); err != nil {
-				return nil, fmt.Errorf("failed N8 id: %v", err)
-			}
-			if err := binary.Read(reader, binary.BigEndian, &val); err != nil {
-				return nil, fmt.Errorf("failed N8 val: %v", err)
-			}
-			_ = id
-			_ = val
+			binary.Read(reader, binary.BigEndian, &id)
+			binary.Read(reader, binary.BigEndian, &val)
 		}
 
-		// NOTE: Codec8 Extended may include NX (IO elements with 2-byte IDs and 2-byte lengths).
-		// Many devices do not use NX. If there are remaining bytes that look like NX entries,
-		// a more complex parser would be required. For now we keep safe parsing above and rely on
-		// the Data Length boundary to skip leftover bytes.
-
-		// Convert timestamp (ms since epoch) to time.Time
 		ts := time.UnixMilli(int64(timestamp))
-
 		lat := float64(latRaw) / 1e7
 		lon := float64(lonRaw) / 1e7
-
-		// Basic sanity: if coords are outside valid ranges, leave them as zero and allow fallback upstream
 		if lat < -90 || lat > 90 {
 			lat = 0
 		}
@@ -428,7 +311,7 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 			lon = 0
 		}
 
-		avl := &AVLData{
+		records = append(records, &AVLData{
 			Timestamp:  ts,
 			Latitude:   lat,
 			Longitude:  lon,
@@ -436,30 +319,12 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 			Angle:      int(angle),
 			Satellites: int(satellites),
 			Speed:      int(speed),
-		}
-
-		// Log the parsed low-level values for debugging
-		log.Printf("📍 Parsed AVL: ts=%s lat=%f lon=%f speed=%d sat=%d angle=%d alt=%d",
-			avl.Timestamp.Format(time.RFC3339),
-			avl.Latitude,
-			avl.Longitude,
-			avl.Speed,
-			avl.Satellites,
-			avl.Angle,
-			avl.Altitude,
-		)
-
-		records = append(records, avl)
+		})
 	}
 
-	// numberOfData2 (1 byte) should be next - read to advance the reader safely
+	// Skip numberOfData2
 	var numberOfData2 byte
-	if err := binary.Read(reader, binary.BigEndian, &numberOfData2); err == nil {
-		_ = numberOfData2
-	}
-
-	// CRC (4 bytes) is not validated here — Teltonika devices include it at the end of frame.
-	// We don't need it for parsing, but the frame slicing in caller ensures we processed correct boundaries.
+	binary.Read(reader, binary.BigEndian, &numberOfData2)
 
 	return records, nil
 }
@@ -474,8 +339,6 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	if err != nil {
 		return err
 	}
-
-	// Ensure rollback on error
 	committed := false
 	defer func() {
 		if !committed {
@@ -495,7 +358,6 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	for _, avl := range records {
 		_, err := stmt.Exec(deviceID, imei, avl.Timestamp, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites)
 		if err != nil {
-			// Log and continue to avoid aborting entire batch on single bad row
 			log.Println("⚠️ Failed insert:", err)
 		}
 	}
