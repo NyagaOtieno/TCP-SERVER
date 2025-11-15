@@ -19,10 +19,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// AVLData represents a parsed FMB920 AVL packet without longitude
+// AVLData represents a parsed FMB920 AVL packet with latitude & longitude
 type AVLData struct {
 	Timestamp  time.Time
 	Latitude   float64
+	Longitude  float64
 	Altitude   int
 	Angle      int
 	Satellites int
@@ -155,6 +156,7 @@ func handleConnection(conn net.Conn) {
 						"imei":       imei,
 						"timestamp":  avl.Timestamp.Format(time.RFC3339),
 						"latitude":   avl.Latitude,
+						"longitude":  avl.Longitude,
 						"speed":      avl.Speed,
 						"angle":      avl.Angle,
 						"altitude":   avl.Altitude,
@@ -220,7 +222,7 @@ func ensureDevice(imei string) (int, error) {
 	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
-// --- Parse Teltonika Codec8 / Codec8 Extended (without longitude) ---
+// --- Parse Teltonika Codec8 / Codec8 Extended (with longitude) ---
 func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("data field too short")
@@ -235,13 +237,14 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	for i := 0; i < int(recordsCount); i++ {
 		var timestamp uint64
 		var priority byte
-		var latRaw int32
+		var latRaw, lngRaw int32
 		var alt, angle, speed uint16
 		var satellites byte
 
 		binary.Read(reader, binary.BigEndian, &timestamp)
 		binary.Read(reader, binary.BigEndian, &priority)
 		binary.Read(reader, binary.BigEndian, &latRaw)
+		binary.Read(reader, binary.BigEndian, &lngRaw)
 		binary.Read(reader, binary.BigEndian, &alt)
 		binary.Read(reader, binary.BigEndian, &angle)
 		binary.Read(reader, binary.BigEndian, &satellites)
@@ -269,6 +272,7 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 		records = append(records, &AVLData{
 			Timestamp:  time.UnixMilli(int64(timestamp)),
 			Latitude:   float64(latRaw) / 1e7,
+			Longitude:  float64(lngRaw) / 1e7,
 			Altitude:   int(alt),
 			Angle:      int(angle),
 			Satellites: int(satellites),
@@ -291,8 +295,8 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO positions (device_id, lat, speed, angle, altitude, satellites, timestamp, imei)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO positions (device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 	`)
 	if err != nil {
 		return err
@@ -300,16 +304,17 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 	defer stmt.Close()
 
 	for _, avl := range records {
-		_, err := stmt.Exec(deviceID, avl.Latitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei)
+		if avl.Latitude == 0 || avl.Longitude == 0 {
+			log.Printf("⚠️ Skipping zero latitude/longitude: %+v", avl)
+			continue
+		}
+		_, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei)
 		if err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return tx.Commit()
 }
 
 // --- Forward positions to backend ---
