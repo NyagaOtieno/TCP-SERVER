@@ -113,9 +113,7 @@ func handleConnection(conn net.Conn) {
 			continue
 		}
 
-		data := make([]byte, n)
-		copy(data, buf[:n])
-
+		data := buf[:n]
 		offset := 0
 		for offset < len(data) {
 			if len(data[offset:]) < 11 {
@@ -142,15 +140,19 @@ func handleConnection(conn net.Conn) {
 				log.Printf("❌ Failed to parse Teltonika frame: %v", err)
 			} else if len(avlRecords) > 0 {
 				log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
+
+				// Store in DB
 				if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
 					log.Printf("❌ Failed to store batch positions: %v", err)
-				} else {
-					log.Printf("📍 %d positions saved for %s", len(avlRecords), imei)
 				}
 
 				// Forward to backend
 				var backendPayload []map[string]interface{}
 				for _, avl := range avlRecords {
+					if avl.Latitude == 0 || avl.Longitude == 0 {
+						log.Printf("⚠️ Skipping zero lat/lng for backend: %+v", avl)
+						continue
+					}
 					backendPayload = append(backendPayload, map[string]interface{}{
 						"device_id":  deviceID,
 						"imei":       imei,
@@ -305,11 +307,10 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 
 	for _, avl := range records {
 		if avl.Latitude == 0 || avl.Longitude == 0 {
-			log.Printf("⚠️ Skipping zero latitude/longitude: %+v", avl)
+			log.Printf("⚠️ Skipping zero lat/lng: %+v", avl)
 			continue
 		}
-		_, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei)
-		if err != nil {
+		if _, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei); err != nil {
 			log.Println("⚠️ Failed insert:", err)
 		}
 	}
