@@ -19,6 +19,10 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// =======================
+//      DATA STRUCTS
+// =======================
+
 type AVLData struct {
 	Timestamp  time.Time
 	Latitude   float64
@@ -28,6 +32,10 @@ type AVLData struct {
 	Satellites int
 	Speed      int
 }
+
+// =======================
+//      GLOBAL CONFIG
+// =======================
 
 var (
 	tcpServerHost   string
@@ -63,6 +71,10 @@ func init() {
 	log.Println("✅ PostgreSQL connected successfully")
 }
 
+// =======================
+//        MAIN
+// =======================
+
 func main() {
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
@@ -74,20 +86,23 @@ func main() {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("⚠️ Failed to accept connection:", err)
+			log.Println("⚠️ Accept error:", err)
 			continue
 		}
 		go handleConnection(conn)
 	}
 }
 
-// --- Handle incoming device connection with proper TCP buffering ---
+// =======================
+//   CONNECTION HANDLER
+// =======================
+
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	imei, err := readIMEI(conn)
 	if err != nil {
-		log.Println("❌ Failed to read IMEI:", err)
+		log.Println("❌ Failed IMEI:", err)
 		return
 	}
 	log.Printf("📡 Device connected: %s", imei)
@@ -98,7 +113,8 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	buffer := make([]byte, 0)
+	// Persistent buffer for this device
+	buf := make([]byte, 0, 8192)
 	tmp := make([]byte, 4096)
 
 	for {
@@ -109,105 +125,141 @@ func handleConnection(conn net.Conn) {
 			}
 			return
 		}
-		if n == 0 {
-			continue
-		}
 
-		buffer = append(buffer, tmp[:n]...)
+		buf = append(buf, tmp[:n]...)
 
-		// Process all complete frames in buffer
 		for {
-			if len(buffer) < 8 {
-				break // Not enough for header
+			frame, frameLen, ok := extractTeltonikaFrame(buf)
+			if !ok {
+				break // need more data
 			}
 
-			// Look for start sequence
-			start := bytes.Index(buffer, []byte{0, 0, 0, 0})
-			if start < 0 {
-				buffer = nil // discard garbage
-				break
-			}
-			if len(buffer[start:]) < 8 {
-				break // Wait for full header
-			}
+			buf = buf[frameLen:] // consume frame
 
-			dataLen := int(binary.BigEndian.Uint32(buffer[start+4 : start+8]))
-			frameEnd := start + 8 + dataLen + 4
-			if len(buffer) < frameEnd {
-				break // Wait for full frame
-			}
-
-			dataField := buffer[start+8 : start+8+dataLen]
-			avlRecords, err := parseTeltonikaDataField(dataField)
+			// Parse frame
+			records, err := parseTeltonikaDataField(frame)
 			if err != nil {
-				log.Printf("❌ Failed to parse Teltonika frame: %v", err)
-			} else if len(avlRecords) > 0 {
-				log.Printf("🔎 Parsed %d AVL record(s) for %s", len(avlRecords), imei)
-
-				// Store in DB
-				if err := storePositionsBatch(deviceID, imei, avlRecords); err != nil {
-					log.Printf("❌ Failed to store batch positions: %v", err)
-				}
-
-				// Forward to backend
-				var backendPayload []map[string]interface{}
-				for _, avl := range avlRecords {
-					if avl.Latitude == 0 || avl.Longitude == 0 {
-						log.Printf("⚠️ Skipping zero lat/lng for backend: %+v", avl)
-						continue
-					}
-					backendPayload = append(backendPayload, map[string]interface{}{
-						"device_id":  deviceID,
-						"imei":       imei,
-						"timestamp":  avl.Timestamp.Format(time.RFC3339),
-						"latitude":   avl.Latitude,
-						"longitude":  avl.Longitude,
-						"speed":      avl.Speed,
-						"angle":      avl.Angle,
-						"altitude":   avl.Altitude,
-						"satellites": avl.Satellites,
-					})
-				}
-				if err := postPositionsToBackend(backendPayload); err != nil {
-					log.Printf("❌ Failed to forward to backend: %v", err)
-				}
+				log.Printf("❌ Frame parse error: %v", err)
+				continue
 			}
 
-			// ACK
-			sendACK(conn, len(avlRecords))
+			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
 
-			// Remove processed frame from buffer
-			buffer = buffer[frameEnd:]
+			// Store in DB
+			if err := storePositionsBatch(deviceID, imei, records); err != nil {
+				log.Printf("❌ DB batch insert failed: %v", err)
+			}
+
+			// Forward to backend
+			payload := make([]map[string]interface{}, 0, len(records))
+			for _, avl := range records {
+				if avl.Latitude == 0 || avl.Longitude == 0 {
+					log.Printf("⚠️ Backend skip zero lat/lng: %+v", avl)
+					continue
+				}
+				payload = append(payload, map[string]interface{}{
+					"device_id":  deviceID,
+					"imei":       imei,
+					"timestamp":  avl.Timestamp.Format(time.RFC3339),
+					"latitude":   avl.Latitude,
+					"longitude":  avl.Longitude,
+					"speed":      avl.Speed,
+					"angle":      avl.Angle,
+					"altitude":   avl.Altitude,
+					"satellites": avl.Satellites,
+				})
+			}
+
+			if err := postPositionsToBackend(payload); err != nil {
+				log.Printf("❌ Failed backend post: %v", err)
+			}
+
+			sendACK(conn, len(records))
 		}
 	}
 }
 
-// --- Read IMEI ---
+// ===============================
+//   TELTONIKA FRAME EXTRACTOR
+// ===============================
+//
+// FULL framed-buffer implementation
+// Handles:
+//  - partial frames
+//  - multiple frames
+//  - fragmented TCP packets
+//
+
+func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
+
+	if len(buf) < 12 {
+		return nil, 0, false
+	}
+
+	// Must start with 4 zero bytes
+	if !(buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0) {
+		// Drop until next possible header
+		for i := 1; i < len(buf)-3; i++ {
+			if buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 0 {
+				return extractTeltonikaFrame(buf[i:])
+			}
+		}
+		return nil, len(buf), false
+	}
+
+	// Length field
+	if len(buf) < 8 {
+		return nil, 0, false
+	}
+
+	dataLen := int(binary.BigEndian.Uint32(buf[4:8]))
+	total := 8 + dataLen + 4 // header + data + CRC
+
+	if len(buf) < total {
+		return nil, 0, false
+	}
+
+	data := buf[8 : 8+dataLen]
+	return data, total, true
+}
+
+// ===============================
+//        IMEI READER
+// ===============================
+
 func readIMEI(conn net.Conn) (string, error) {
 	buf := make([]byte, 32)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return "", err
 	}
-	imeiRaw := string(buf[:n])
+	raw := string(buf[:n])
+
 	re := regexp.MustCompile(`\D`)
-	imei := re.ReplaceAllString(imeiRaw, "")
+	imei := re.ReplaceAllString(raw, "")
+
 	conn.Write([]byte{0x01})
-	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", imeiRaw, imei)
+
+	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", raw, imei)
 	return imei, nil
 }
 
-// --- Ensure device exists ---
+// ===============================
+//        DEVICE LOOKUP
+// ===============================
+
 func ensureDevice(imei string) (int, error) {
 	var id int
+
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
 
+	// fetch from backend
 	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
 	if err != nil {
-		return 0, fmt.Errorf("failed to GET devices list: %v", err)
+		return 0, fmt.Errorf("failed GET devices list: %v", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -217,7 +269,7 @@ func ensureDevice(imei string) (int, error) {
 		IMEI string `json:"imei"`
 	}
 	if err := json.Unmarshal(body, &devices); err != nil {
-		return 0, fmt.Errorf("failed to parse devices list: %v\n%s", err, string(body))
+		return 0, fmt.Errorf("parse devices list failed: %v", err)
 	}
 
 	for _, d := range devices {
@@ -226,10 +278,178 @@ func ensureDevice(imei string) (int, error) {
 			return d.ID, nil
 		}
 	}
-	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
+	return 0, fmt.Errorf("device IMEI %s not found", imei)
 }
 
-// --- Send ACK to device ---
+// ===============================
+//   TELTONIKA DATA PARSER
+// ===============================
+
+func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("data too short")
+	}
+
+	reader := bytes.NewReader(data)
+	var codecID, recordCount byte
+	binary.Read(reader, binary.BigEndian, &codecID)
+	binary.Read(reader, binary.BigEndian, &recordCount)
+
+	records := make([]*AVLData, 0, recordCount)
+
+	for i := 0; i < int(recordCount); i++ {
+
+		var (
+			timestamp        uint64
+			priority         byte
+			latRaw, lngRaw   int32
+			alt, angle, spd  uint16
+			sats             byte
+		)
+
+		binary.Read(reader, binary.BigEndian, &timestamp)
+		binary.Read(reader, binary.BigEndian, &priority)
+		binary.Read(reader, binary.BigEndian, &latRaw)
+		binary.Read(reader, binary.BigEndian, &lngRaw)
+		binary.Read(reader, binary.BigEndian, &alt)
+		binary.Read(reader, binary.BigEndian, &angle)
+		binary.Read(reader, binary.BigEndian, &sats)
+		binary.Read(reader, binary.BigEndian, &spd)
+
+		if err := skipIO(reader); err != nil {
+			log.Printf("⚠️ IO skip error: %v", err)
+			break
+		}
+
+		ts := int64(timestamp)
+		if ts <= 0 || ts > 32503680000000 {
+			log.Printf("⚠️ Invalid ts: %d", ts)
+			continue
+		}
+
+		lat := float64(latRaw) / 1e7
+		lng := float64(lngRaw) / 1e7
+		if lat == 0 || lng == 0 {
+			log.Printf("⚠️ Zero lat/lng")
+			continue
+		}
+
+		records = append(records, &AVLData{
+			Timestamp:  time.UnixMilli(ts),
+			Latitude:   lat,
+			Longitude:  lng,
+			Altitude:   int(alt),
+			Angle:      int(angle),
+			Satellites: int(sats),
+			Speed:      int(spd),
+		})
+	}
+
+	return records, nil
+}
+
+// ===============================
+//     IO SKIPPER (SAFE)
+// ===============================
+
+func skipIO(r *bytes.Reader) error {
+	var n1, n2, n4, n8 byte
+
+	if err := binary.Read(r, binary.BigEndian, &n1); err != nil {
+		return err
+	}
+	for i := 0; i < int(n1); i++ {
+		r.Seek(2, io.SeekCurrent)
+	}
+
+	if err := binary.Read(r, binary.BigEndian, &n2); err != nil {
+		return err
+	}
+	for i := 0; i < int(n2); i++ {
+		r.Seek(3, io.SeekCurrent)
+	}
+
+	if err := binary.Read(r, binary.BigEndian, &n4); err != nil {
+		return err
+	}
+	for i := 0; i < int(n4); i++ {
+		r.Seek(5, io.SeekCurrent)
+	}
+
+	if err := binary.Read(r, binary.BigEndian, &n8); err != nil {
+		return err
+	}
+	for i := 0; i < int(n8); i++ {
+		r.Seek(9, io.SeekCurrent)
+	}
+	return nil
+}
+
+// ===============================
+//     DB BATCH INSERT
+// ===============================
+
+func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
+	if len(recs) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO positions (device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, r := range recs {
+		_, err := stmt.Exec(
+			deviceID, r.Latitude, r.Longitude, r.Speed,
+			r.Angle, r.Altitude, r.Satellites, r.Timestamp, imei,
+		)
+		if err != nil {
+			log.Println("⚠️ Insert err:", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ===============================
+//      BACKEND FORWARDER
+// ===============================
+
+func postPositionsToBackend(positions []map[string]interface{}) error {
+	if len(positions) == 0 {
+		return nil
+	}
+
+	data, _ := json.Marshal(positions)
+	req, _ := http.NewRequest("POST", backendTrackURL, bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("📬 Backend response (%d): %s", resp.StatusCode, string(body))
+	return nil
+}
+
+// ===============================
+//       ACK SENDER
+// ===============================
+
 func sendACK(conn net.Conn, count int) {
 	ack := make([]byte, 5)
 	binary.BigEndian.PutUint32(ack, uint32(count))
@@ -237,12 +457,13 @@ func sendACK(conn net.Conn, count int) {
 	conn.Write(ack)
 }
 
-// --- Helpers ---
+// ===============================
+//         HELPERS
+// ===============================
+
 func getEnv(key, fallback string) string {
-	if val, ok := os.LookupEnv(key); ok {
-		return val
+	if v, ok := os.LookupEnv(key); ok {
+		return v
 	}
 	return fallback
 }
-
-// --- parseTeltonikaDataField and skipIO remain unchanged ---
