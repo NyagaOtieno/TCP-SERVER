@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -134,6 +135,9 @@ func handleConnection(conn net.Conn) {
 				break // need more data
 			}
 
+			// Log exact hex payload
+			log.Printf("🧩 Received frame HEX: %s", hex.EncodeToString(frame))
+
 			buf = buf[frameLen:] // consume frame
 
 			// Parse frame
@@ -182,13 +186,6 @@ func handleConnection(conn net.Conn) {
 // ===============================
 //   TELTONIKA FRAME EXTRACTOR
 // ===============================
-//
-// FULL framed-buffer implementation
-// Handles:
-//  - partial frames
-//  - multiple frames
-//  - fragmented TCP packets
-//
 
 func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
 
@@ -256,7 +253,6 @@ func ensureDevice(imei string) (int, error) {
 		return id, nil
 	}
 
-	// fetch from backend
 	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
 	if err != nil {
 		return 0, fmt.Errorf("failed GET devices list: %v", err)
