@@ -171,7 +171,7 @@ func handleConnection(conn net.Conn) {
 			}
 
 			// ACK
-			conn.Write([]byte{0x01})
+			sendACK(conn, len(avlRecords))
 			offset = frameEnd
 		}
 	}
@@ -224,11 +224,12 @@ func ensureDevice(imei string) (int, error) {
 	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
-// --- Parse Teltonika Codec8 / Codec8 Extended (with longitude) ---
+// --- Parse Teltonika Codec8 / Codec8 Extended (safe) ---
 func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("data field too short")
 	}
+
 	reader := bytes.NewReader(data)
 	var codecID, recordsCount byte
 	binary.Read(reader, binary.BigEndian, &codecID)
@@ -252,38 +253,75 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 		binary.Read(reader, binary.BigEndian, &satellites)
 		binary.Read(reader, binary.BigEndian, &speed)
 
-		// skip IO elements
-		var n1, n2, n4, n8 byte
-		binary.Read(reader, binary.BigEndian, &n1)
-		for j := 0; j < int(n1); j++ {
-			reader.Seek(2, io.SeekCurrent)
-		}
-		binary.Read(reader, binary.BigEndian, &n2)
-		for j := 0; j < int(n2); j++ {
-			reader.Seek(3, io.SeekCurrent)
-		}
-		binary.Read(reader, binary.BigEndian, &n4)
-		for j := 0; j < int(n4); j++ {
-			reader.Seek(5, io.SeekCurrent)
-		}
-		binary.Read(reader, binary.BigEndian, &n8)
-		for j := 0; j < int(n8); j++ {
-			reader.Seek(9, io.SeekCurrent)
+		// skip IO elements safely
+		if err := skipIO(reader); err != nil {
+			log.Printf("⚠️ Failed to skip IO: %v", err)
+			break
 		}
 
-		// --- inside parseTeltonikaDataField ---
-records = append(records, &AVLData{
-	Timestamp:  time.UnixMilli(int64(timestamp)), // ✅ use milliseconds
-	Latitude:   float64(latRaw) / 1e7,
-	Longitude:  float64(lngRaw) / 1e7,
-	Altitude:   int(alt),
-	Angle:      int(angle),
-	Satellites: int(satellites),
-	Speed:      int(speed),
-})
+		ts := int64(timestamp)
+		if ts <= 0 || ts > time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli() {
+			log.Printf("⚠️ Skipping invalid timestamp: %d", ts)
+			continue
+		}
+
+		lat := float64(latRaw) / 1e7
+		lng := float64(lngRaw) / 1e7
+		if lat == 0 || lng == 0 {
+			log.Printf("⚠️ Skipping zero lat/lng")
+			continue
+		}
+
+		records = append(records, &AVLData{
+			Timestamp:  time.UnixMilli(ts),
+			Latitude:   lat,
+			Longitude:  lng,
+			Altitude:   int(alt),
+			Angle:      int(angle),
+			Satellites: int(satellites),
+			Speed:      int(speed),
+		})
 	}
 
 	return records, nil
+}
+
+// --- Skip IO elements safely ---
+func skipIO(reader *bytes.Reader) error {
+	var n1, n2, n4, n8 byte
+	if err := binary.Read(reader, binary.BigEndian, &n1); err != nil {
+		return err
+	}
+	for i := 0; i < int(n1); i++ {
+		if _, err := reader.Seek(2, io.SeekCurrent); err != nil {
+			return err
+		}
+	}
+	if err := binary.Read(reader, binary.BigEndian, &n2); err != nil {
+		return err
+	}
+	for i := 0; i < int(n2); i++ {
+		if _, err := reader.Seek(3, io.SeekCurrent); err != nil {
+			return err
+		}
+	}
+	if err := binary.Read(reader, binary.BigEndian, &n4); err != nil {
+		return err
+	}
+	for i := 0; i < int(n4); i++ {
+		if _, err := reader.Seek(5, io.SeekCurrent); err != nil {
+			return err
+		}
+	}
+	if err := binary.Read(reader, binary.BigEndian, &n8); err != nil {
+		return err
+	}
+	for i := 0; i < int(n8); i++ {
+		if _, err := reader.Seek(9, io.SeekCurrent); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // --- Batch insert into PostgreSQL ---
@@ -308,7 +346,6 @@ func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
 
 	for _, avl := range records {
 		if avl.Latitude == 0 || avl.Longitude == 0 {
-			log.Printf("⚠️ Skipping zero lat/lng: %+v", avl)
 			continue
 		}
 		if _, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei); err != nil {
@@ -335,6 +372,14 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 	body, _ := io.ReadAll(resp.Body)
 	log.Printf("📬 Backend response (%d): %s", resp.StatusCode, string(body))
 	return nil
+}
+
+// --- Send ACK to device ---
+func sendACK(conn net.Conn, count int) {
+	ack := make([]byte, 5)
+	binary.BigEndian.PutUint32(ack, uint32(count))
+	ack[4] = 0x01
+	conn.Write(ack)
 }
 
 // --- Helpers ---
