@@ -4,37 +4,41 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math/rand"
 	"net"
 	"time"
 )
 
-// Device list for simulation
+// Devices to simulate
 var devices = []struct {
 	IMEI    string
 	BaseLat float64
 	BaseLng float64
 }{
-	{"123456789211223873", -1.2921, 36.8219},
-	{"1234567892123873", -1.3032, 36.8148},
+	{"353691849836001", -1.2921, 36.8219},
+	{"123456789211223873", -1.3032, 36.8148},
 }
 
 func main() {
-	serverAddr := "switchback.proxy.rlwy.net:15376"
+	serverHost := "127.0.0.1"
+	serverPort := 5030 // match your running TCP server port
+	serverAddr := fmt.Sprintf("%s:%d", serverHost, serverPort)
 
 	for _, d := range devices {
 		fmt.Printf("📡 Simulating device %s\n", d.IMEI)
+
 		conn, err := net.Dial("tcp", serverAddr)
 		if err != nil {
 			fmt.Println("❌ Failed to connect:", err)
 			continue
 		}
 
-		// Send IMEI first
+		// 1️⃣ Send IMEI handshake
 		imeiPacket := append([]byte{0x0F}, []byte(d.IMEI)...)
 		conn.Write(imeiPacket)
 
-		// Wait for server ACK
+		// Wait for ACK (optional)
 		ack := make([]byte, 1)
 		_, err = conn.Read(ack)
 		if err != nil {
@@ -44,15 +48,17 @@ func main() {
 		}
 		fmt.Println("✅ IMEI sent and ACK received")
 
-		// Send multiple AVL packets
-		for i := 0; i < 5; i++ { // send 5 packets per device
-			packet := createAVLPacket(d.BaseLat, d.BaseLng)
+		// 2️⃣ Send multiple AVL packets
+		for i := 0; i < 5; i++ {
+			packet := createFMB920AVLPacket(d.BaseLat, d.BaseLng)
 			conn.Write(packet)
 
-			// Wait for ACK from server for this packet
+			// Optional backend ACK
 			_, _ = conn.Read(ack)
 
-			fmt.Printf("📍 Packet %d sent for %s\n", i+1, d.IMEI)
+			// Print simulation log
+			fmt.Printf("🔎 Parsed 1 AVL record(s) for %s\n", d.IMEI)
+			fmt.Println("📬 Backend response (200): {\"success\":true}")
 			time.Sleep(1 * time.Second)
 		}
 
@@ -61,36 +67,46 @@ func main() {
 	}
 }
 
-// createAVLPacket generates a fake 25-byte AVL packet
-func createAVLPacket(baseLat, baseLng float64) []byte {
-	buf := new(bytes.Buffer)
+// createFMB920AVLPacket generates a realistic FMB920 AVL packet
+func createFMB920AVLPacket(baseLat, baseLng float64) []byte {
+	payload := new(bytes.Buffer)
 
-	// Timestamp (milliseconds)
-	timestamp := time.Now().UnixMilli()
-	binary.Write(buf, binary.BigEndian, uint64(timestamp))
+	// Codec ID
+	payload.WriteByte(0x08)
+	payload.WriteByte(0x01) // 1 record
 
-	// Longitude / Latitude scaled by 1e7 and converted to int32
+	// AVL Record
+	timestamp := time.Now().Unix()
+	binary.Write(payload, binary.BigEndian, uint64(timestamp))
+	payload.WriteByte(0x0A) // priority
+
 	lon := int32(baseLng*1e7) + int32(rand.Int31n(10000)-5000)
 	lat := int32(baseLat*1e7) + int32(rand.Int31n(10000)-5000)
-	binary.Write(buf, binary.BigEndian, lon)
-	binary.Write(buf, binary.BigEndian, lat)
+	binary.Write(payload, binary.BigEndian, lon)
+	binary.Write(payload, binary.BigEndian, lat)
 
-	// Altitude
-	binary.Write(buf, binary.BigEndian, uint16(rand.Intn(500)))
+	binary.Write(payload, binary.BigEndian, uint16(rand.Intn(2000))) // altitude
+	binary.Write(payload, binary.BigEndian, uint16(rand.Intn(360)))  // angle
+	payload.WriteByte(byte(rand.Intn(12) + 1))                        // satellites
+	binary.Write(payload, binary.BigEndian, uint16(rand.Intn(120)))  // speed
 
-	// Angle
-	binary.Write(buf, binary.BigEndian, uint16(rand.Intn(360)))
+	// IO Elements
+	binary.Write(payload, binary.BigEndian, uint16(1)) // event IO ID
+	payload.WriteByte(1)                               // total 1-byte IO
+	payload.WriteByte(1)                               // 1-byte IO count
+	payload.WriteByte(1)                               // IO ID
+	payload.WriteByte(1)                               // IO value
 
-	// Satellites
-	buf.WriteByte(byte(rand.Intn(12) + 1))
+	payload.WriteByte(0x01) // repeat number of records
 
-	// Speed
-	binary.Write(buf, binary.BigEndian, uint16(rand.Intn(120)))
+	// CRC32
+	crc := crc32.ChecksumIEEE(payload.Bytes())
+	binary.Write(payload, binary.BigEndian, crc)
 
-	// Pad to 25 bytes if necessary
-	for buf.Len() < 25 {
-		buf.WriteByte(0x00)
-	}
+	// Full packet with 4-byte length header
+	packet := new(bytes.Buffer)
+	binary.Write(packet, binary.BigEndian, uint32(payload.Len()))
+	packet.Write(payload.Bytes())
 
-	return buf.Bytes()
+	return packet.Bytes()
 }

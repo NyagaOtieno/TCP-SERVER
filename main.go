@@ -271,15 +271,16 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 			reader.Seek(9, io.SeekCurrent)
 		}
 
-		records = append(records, &AVLData{
-			Timestamp:  time.UnixMilli(int64(timestamp)),
-			Latitude:   float64(latRaw) / 1e7,
-			Longitude:  float64(lngRaw) / 1e7,
-			Altitude:   int(alt),
-			Angle:      int(angle),
-			Satellites: int(satellites),
-			Speed:      int(speed),
-		})
+		// --- inside parseTeltonikaDataField ---
+records = append(records, &AVLData{
+	Timestamp:  time.UnixMilli(int64(timestamp)), // ✅ use milliseconds
+	Latitude:   float64(latRaw) / 1e7,
+	Longitude:  float64(lngRaw) / 1e7,
+	Altitude:   int(alt),
+	Angle:      int(angle),
+	Satellites: int(satellites),
+	Speed:      int(speed),
+})
 	}
 
 	return records, nil
