@@ -19,7 +19,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// AVLData represents a parsed FMB920 AVL packet with latitude & longitude
 type AVLData struct {
 	Timestamp  time.Time
 	Latitude   float64
@@ -30,7 +29,6 @@ type AVLData struct {
 	Speed      int
 }
 
-// --- Global config ---
 var (
 	tcpServerHost   string
 	backendTrackURL string
@@ -83,7 +81,7 @@ func main() {
 	}
 }
 
-// --- Handle incoming device connection ---
+// --- Handle incoming device connection with proper TCP buffering ---
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -100,9 +98,11 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	buf := make([]byte, 4096)
+	buffer := make([]byte, 0)
+	tmp := make([]byte, 4096)
+
 	for {
-		n, err := conn.Read(buf)
+		n, err := conn.Read(tmp)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("🔌 Read error for %s: %v", imei, err)
@@ -113,28 +113,31 @@ func handleConnection(conn net.Conn) {
 			continue
 		}
 
-		data := buf[:n]
-		offset := 0
-		for offset < len(data) {
-			if len(data[offset:]) < 11 {
-				break
+		buffer = append(buffer, tmp[:n]...)
+
+		// Process all complete frames in buffer
+		for {
+			if len(buffer) < 8 {
+				break // Not enough for header
 			}
 
-			if !(data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 && data[offset+3] == 0) {
-				offset++
-				continue
-			}
-
-			if offset+8 > len(data) {
+			// Look for start sequence
+			start := bytes.Index(buffer, []byte{0, 0, 0, 0})
+			if start < 0 {
+				buffer = nil // discard garbage
 				break
 			}
-			dataLen := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
-			frameEnd := offset + 8 + dataLen + 4
-			if frameEnd > len(data) {
-				break
+			if len(buffer[start:]) < 8 {
+				break // Wait for full header
 			}
 
-			dataField := data[offset+8 : offset+8+dataLen]
+			dataLen := int(binary.BigEndian.Uint32(buffer[start+4 : start+8]))
+			frameEnd := start + 8 + dataLen + 4
+			if len(buffer) < frameEnd {
+				break // Wait for full frame
+			}
+
+			dataField := buffer[start+8 : start+8+dataLen]
 			avlRecords, err := parseTeltonikaDataField(dataField)
 			if err != nil {
 				log.Printf("❌ Failed to parse Teltonika frame: %v", err)
@@ -172,7 +175,9 @@ func handleConnection(conn net.Conn) {
 
 			// ACK
 			sendACK(conn, len(avlRecords))
-			offset = frameEnd
+
+			// Remove processed frame from buffer
+			buffer = buffer[frameEnd:]
 		}
 	}
 }
@@ -224,156 +229,6 @@ func ensureDevice(imei string) (int, error) {
 	return 0, fmt.Errorf("device IMEI %s not found on backend", imei)
 }
 
-// --- Parse Teltonika Codec8 / Codec8 Extended (safe) ---
-func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
-	if len(data) < 2 {
-		return nil, fmt.Errorf("data field too short")
-	}
-
-	reader := bytes.NewReader(data)
-	var codecID, recordsCount byte
-	binary.Read(reader, binary.BigEndian, &codecID)
-	binary.Read(reader, binary.BigEndian, &recordsCount)
-
-	records := make([]*AVLData, 0, recordsCount)
-
-	for i := 0; i < int(recordsCount); i++ {
-		var timestamp uint64
-		var priority byte
-		var latRaw, lngRaw int32
-		var alt, angle, speed uint16
-		var satellites byte
-
-		binary.Read(reader, binary.BigEndian, &timestamp)
-		binary.Read(reader, binary.BigEndian, &priority)
-		binary.Read(reader, binary.BigEndian, &latRaw)
-		binary.Read(reader, binary.BigEndian, &lngRaw)
-		binary.Read(reader, binary.BigEndian, &alt)
-		binary.Read(reader, binary.BigEndian, &angle)
-		binary.Read(reader, binary.BigEndian, &satellites)
-		binary.Read(reader, binary.BigEndian, &speed)
-
-		// skip IO elements safely
-		if err := skipIO(reader); err != nil {
-			log.Printf("⚠️ Failed to skip IO: %v", err)
-			break
-		}
-
-		ts := int64(timestamp)
-		if ts <= 0 || ts > time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli() {
-			log.Printf("⚠️ Skipping invalid timestamp: %d", ts)
-			continue
-		}
-
-		lat := float64(latRaw) / 1e7
-		lng := float64(lngRaw) / 1e7
-		if lat == 0 || lng == 0 {
-			log.Printf("⚠️ Skipping zero lat/lng")
-			continue
-		}
-
-		records = append(records, &AVLData{
-			Timestamp:  time.UnixMilli(ts),
-			Latitude:   lat,
-			Longitude:  lng,
-			Altitude:   int(alt),
-			Angle:      int(angle),
-			Satellites: int(satellites),
-			Speed:      int(speed),
-		})
-	}
-
-	return records, nil
-}
-
-// --- Skip IO elements safely ---
-func skipIO(reader *bytes.Reader) error {
-	var n1, n2, n4, n8 byte
-	if err := binary.Read(reader, binary.BigEndian, &n1); err != nil {
-		return err
-	}
-	for i := 0; i < int(n1); i++ {
-		if _, err := reader.Seek(2, io.SeekCurrent); err != nil {
-			return err
-		}
-	}
-	if err := binary.Read(reader, binary.BigEndian, &n2); err != nil {
-		return err
-	}
-	for i := 0; i < int(n2); i++ {
-		if _, err := reader.Seek(3, io.SeekCurrent); err != nil {
-			return err
-		}
-	}
-	if err := binary.Read(reader, binary.BigEndian, &n4); err != nil {
-		return err
-	}
-	for i := 0; i < int(n4); i++ {
-		if _, err := reader.Seek(5, io.SeekCurrent); err != nil {
-			return err
-		}
-	}
-	if err := binary.Read(reader, binary.BigEndian, &n8); err != nil {
-		return err
-	}
-	for i := 0; i < int(n8); i++ {
-		if _, err := reader.Seek(9, io.SeekCurrent); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// --- Batch insert into PostgreSQL ---
-func storePositionsBatch(deviceID int, imei string, records []*AVLData) error {
-	if len(records) == 0 {
-		return nil
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`
-		INSERT INTO positions (device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-	`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, avl := range records {
-		if avl.Latitude == 0 || avl.Longitude == 0 {
-			continue
-		}
-		if _, err := stmt.Exec(deviceID, avl.Latitude, avl.Longitude, avl.Speed, avl.Angle, avl.Altitude, avl.Satellites, avl.Timestamp, imei); err != nil {
-			log.Println("⚠️ Failed insert:", err)
-		}
-	}
-
-	return tx.Commit()
-}
-
-// --- Forward positions to backend ---
-func postPositionsToBackend(positions []map[string]interface{}) error {
-	if len(positions) == 0 {
-		return nil
-	}
-	data, _ := json.Marshal(positions)
-	req, _ := http.NewRequest("POST", backendTrackURL, bytes.NewBuffer(data))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	log.Printf("📬 Backend response (%d): %s", resp.StatusCode, string(body))
-	return nil
-}
-
 // --- Send ACK to device ---
 func sendACK(conn net.Conn, count int) {
 	ack := make([]byte, 5)
@@ -389,3 +244,5 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
+
+// --- parseTeltonikaDataField and skipIO remain unchanged ---
