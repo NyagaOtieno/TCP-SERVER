@@ -129,14 +129,19 @@ func handleConnection(conn net.Conn) {
 
 		buf = append(buf, tmp[:n]...)
 
+		// Log raw TCP bytes in hex
+		if n > 0 {
+			log.Printf("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
+		}
+
 		for {
 			frame, frameLen, ok := extractTeltonikaFrame(buf)
 			if !ok {
 				break // need more data
 			}
 
-			// Log exact hex payload
-			log.Printf("🧩 Received frame HEX: %s", hex.EncodeToString(frame))
+			// Log extracted frame in hex
+			log.Printf("🧩 Extracted frame HEX: %s", hex.EncodeToString(frame))
 
 			buf = buf[frameLen:] // consume frame
 
@@ -188,7 +193,6 @@ func handleConnection(conn net.Conn) {
 // ===============================
 
 func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
-
 	if len(buf) < 12 {
 		return nil, 0, false
 	}
@@ -253,6 +257,7 @@ func ensureDevice(imei string) (int, error) {
 		return id, nil
 	}
 
+	// fetch from backend
 	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
 	if err != nil {
 		return 0, fmt.Errorf("failed GET devices list: %v", err)
@@ -294,7 +299,6 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 	records := make([]*AVLData, 0, recordCount)
 
 	for i := 0; i < int(recordCount); i++ {
-
 		var (
 			timestamp        uint64
 			priority         byte
