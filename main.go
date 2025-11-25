@@ -32,6 +32,8 @@ type AVLData struct {
 	Angle      int
 	Satellites int
 	Speed      int
+	Raw        []byte
+	IO         []map[string]interface{}
 }
 
 // =======================
@@ -77,6 +79,27 @@ func init() {
 // =======================
 
 func main() {
+	// If DECODE_HEX is provided, decode it and exit (helpful for offline debugging)
+	if hexIn := strings.TrimSpace(os.Getenv("DECODE_HEX")); hexIn != "" {
+		log.Println("🔎 Decoding DECODE_HEX payload...")
+		b, err := hex.DecodeString(strings.TrimSpace(hexIn))
+		if err != nil {
+			log.Fatalf("❌ Invalid HEX in DECODE_HEX: %v", err)
+		}
+		// If the hex includes header (0000 + len + data + crc) detect and extract data field
+		dataField := b
+		if len(b) >= 12 && bytes.Equal(b[:4], []byte{0, 0, 0, 0}) {
+			if len(b) >= 8 {
+				dl := int(binary.BigEndian.Uint32(b[4:8]))
+				if 8+dl+4 <= len(b) {
+					dataField = b[8 : 8+dl]
+				}
+			}
+		}
+		DumpCodec8(dataField)
+		return
+	}
+
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
 		log.Fatalf("❌ Failed to start TCP server: %v", err)
@@ -127,63 +150,73 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
+		if n == 0 {
+			continue
+		}
+
+		// Append incoming bytes to persistent buffer
 		buf = append(buf, tmp[:n]...)
 
-		// Log raw TCP bytes in hex
+		// Log raw TCP bytes in hex (concise)
 		if n > 0 {
 			log.Printf("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 		}
 
+		// Extract all complete frames available in buffer
 		for {
 			frame, frameLen, ok := extractTeltonikaFrame(buf)
 			if !ok {
 				break // need more data
 			}
 
-			// Log extracted frame in hex
+			// Log extracted frame hex (data field only)
 			log.Printf("🧩 Extracted frame HEX: %s", hex.EncodeToString(frame))
 
-			buf = buf[frameLen:] // consume frame
+			// Dump decoded contents (verbose)
+			DumpCodec8(frame)
 
-			// Parse frame
+			// Parse frame to records for storage/forwarding
 			records, err := parseTeltonikaDataField(frame)
 			if err != nil {
 				log.Printf("❌ Frame parse error: %v", err)
-				continue
-			}
+			} else {
+				log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
 
-			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
-
-			// Store in DB
-			if err := storePositionsBatch(deviceID, imei, records); err != nil {
-				log.Printf("❌ DB batch insert failed: %v", err)
-			}
-
-			// Forward to backend
-			payload := make([]map[string]interface{}, 0, len(records))
-			for _, avl := range records {
-				if avl.Latitude == 0 || avl.Longitude == 0 {
-					log.Printf("⚠️ Backend skip zero lat/lng: %+v", avl)
-					continue
+				// Store in DB
+				if err := storePositionsBatch(deviceID, imei, records); err != nil {
+					log.Printf("❌ DB batch insert failed: %v", err)
 				}
-				payload = append(payload, map[string]interface{}{
-					"device_id":  deviceID,
-					"imei":       imei,
-					"timestamp":  avl.Timestamp.Format(time.RFC3339),
-					"latitude":   avl.Latitude,
-					"longitude":  avl.Longitude,
-					"speed":      avl.Speed,
-					"angle":      avl.Angle,
-					"altitude":   avl.Altitude,
-					"satellites": avl.Satellites,
-				})
+
+				// Forward to backend
+				payload := make([]map[string]interface{}, 0, len(records))
+				for _, avl := range records {
+					if avl.Latitude == 0 || avl.Longitude == 0 {
+						log.Printf("⚠️ Backend skip zero lat/lng: %+v", avl)
+						continue
+					}
+					payload = append(payload, map[string]interface{}{
+						"device_id":  deviceID,
+						"imei":       imei,
+						"timestamp":  avl.Timestamp.Format(time.RFC3339),
+						"latitude":   avl.Latitude,
+						"longitude":  avl.Longitude,
+						"speed":      avl.Speed,
+						"angle":      avl.Angle,
+						"altitude":   avl.Altitude,
+						"satellites": avl.Satellites,
+					})
+				}
+
+				if err := postPositionsToBackend(payload); err != nil {
+					log.Printf("❌ Failed backend post: %v", err)
+				}
 			}
 
-			if err := postPositionsToBackend(payload); err != nil {
-				log.Printf("❌ Failed backend post: %v", err)
-			}
-
+			// ACK device with number of records (as you already do)
 			sendACK(conn, len(records))
+
+			// consume frame bytes from buffer
+			buf = buf[frameLen:]
 		}
 	}
 }
@@ -193,33 +226,43 @@ func handleConnection(conn net.Conn) {
 // ===============================
 
 func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
+	// We expect at least: 4 bytes zeros + 4 bytes dataLen + ≥0 data + 4 bytes CRC = 12 minimum
 	if len(buf) < 12 {
 		return nil, 0, false
 	}
 
 	// Must start with 4 zero bytes
 	if !(buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0) {
-		// Drop until next possible header
+		// Drop until next possible header to re-sync
 		for i := 1; i < len(buf)-3; i++ {
 			if buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 0 {
 				return extractTeltonikaFrame(buf[i:])
 			}
 		}
+		// nothing found — consume entire buffer (safe fallback)
 		return nil, len(buf), false
 	}
 
-	// Length field
+	// Need at least 8 bytes to read dataLen
 	if len(buf) < 8 {
 		return nil, 0, false
 	}
 
 	dataLen := int(binary.BigEndian.Uint32(buf[4:8]))
-	total := 8 + dataLen + 4 // header + data + CRC
+	// protect against insane lengths
+	if dataLen < 0 || dataLen > 100*1024 {
+		// corrupt length — drop header and resync
+		log.Printf("⚠️ Invalid dataLen: %d (dropping 4 bytes to resync)", dataLen)
+		return nil, 4, false
+	}
 
+	total := 8 + dataLen + 4 // header (8) + data + CRC (4)
 	if len(buf) < total {
+		// incomplete frame
 		return nil, 0, false
 	}
 
+	// data field (what codec parser expects)
 	data := buf[8 : 8+dataLen]
 	return data, total, true
 }
@@ -229,16 +272,17 @@ func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
 // ===============================
 
 func readIMEI(conn net.Conn) (string, error) {
-	buf := make([]byte, 32)
+	buf := make([]byte, 64)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return "", err
 	}
 	raw := string(buf[:n])
 
-	re := regexp.MustCompile(`\D`)
+	re := regexp.MustCompile(\D)
 	imei := re.ReplaceAllString(raw, "")
 
+	// ack login
 	conn.Write([]byte{0x01})
 
 	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", raw, imei)
@@ -266,8 +310,8 @@ func ensureDevice(imei string) (int, error) {
 	body, _ := io.ReadAll(resp.Body)
 
 	var devices []struct {
-		ID   int    `json:"id"`
-		IMEI string `json:"imei"`
+		ID   int    json:"id"
+		IMEI string json:"imei"
 	}
 	if err := json.Unmarshal(body, &devices); err != nil {
 		return 0, fmt.Errorf("parse devices list failed: %v", err)
@@ -293,33 +337,68 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 
 	reader := bytes.NewReader(data)
 	var codecID, recordCount byte
-	binary.Read(reader, binary.BigEndian, &codecID)
-	binary.Read(reader, binary.BigEndian, &recordCount)
+	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
+		return nil, fmt.Errorf("read codec: %w", err)
+	}
+	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
+		return nil, fmt.Errorf("read recordCount: %w", err)
+	}
+
+	// only support Codec 8
+	if codecID != 0x08 {
+		return nil, fmt.Errorf("unsupported codec: 0x%X", codecID)
+	}
 
 	records := make([]*AVLData, 0, recordCount)
 
 	for i := 0; i < int(recordCount); i++ {
+		start := reader.Len()
 		var (
-			timestamp        uint64
-			priority         byte
-			latRaw, lngRaw   int32
-			alt, angle, spd  uint16
-			sats             byte
+			timestamp uint64
+			priority  byte
+			latRaw    int32
+			lngRaw    int32
+			alt       uint16
+			angle     uint16
+			sats      byte
+			spd       uint16
 		)
-
-		binary.Read(reader, binary.BigEndian, &timestamp)
-		binary.Read(reader, binary.BigEndian, &priority)
-		binary.Read(reader, binary.BigEndian, &latRaw)
-		binary.Read(reader, binary.BigEndian, &lngRaw)
-		binary.Read(reader, binary.BigEndian, &alt)
-		binary.Read(reader, binary.BigEndian, &angle)
-		binary.Read(reader, binary.BigEndian, &sats)
-		binary.Read(reader, binary.BigEndian, &spd)
-
-		if err := skipIO(reader); err != nil {
-			log.Printf("⚠️ IO skip error: %v", err)
-			break
+		if err := binary.Read(reader, binary.BigEndian, &timestamp); err != nil {
+			return records, fmt.Errorf("read timestamp: %w", err)
 		}
+		if err := binary.Read(reader, binary.BigEndian, &priority); err != nil {
+			return records, fmt.Errorf("read priority: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &lngRaw); err != nil {
+			return records, fmt.Errorf("read lon: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &latRaw); err != nil {
+			return records, fmt.Errorf("read lat: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &alt); err != nil {
+			return records, fmt.Errorf("read alt: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &angle); err != nil {
+			return records, fmt.Errorf("read angle: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &sats); err != nil {
+			return records, fmt.Errorf("read sats: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &spd); err != nil {
+			return records, fmt.Errorf("read speed: %w", err)
+		}
+
+		// parse IO and capture raw IO bytes using helper
+		ioStartPos := len(data) - reader.Len()
+		ioMap, err := parseIOElements(reader)
+		if err != nil {
+			// if IO parse fails due to EOF, break gracefully
+			log.Printf("⚠️ IO skip error: %v", err)
+			// continue — we can still build record with what we have
+		}
+		ioEndPos := len(data) - reader.Len()
+		rawRec := make([]byte, ioEndPos-ioStartPos)
+		copy(rawRec, data[ioStartPos:ioEndPos])
 
 		ts := int64(timestamp)
 		if ts <= 0 || ts > 32503680000000 {
@@ -342,47 +421,182 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 			Angle:      int(angle),
 			Satellites: int(sats),
 			Speed:      int(spd),
+			Raw:        rawRec,
+			IO:         ioMap,
 		})
+		_ = start
 	}
 
 	return records, nil
 }
 
-// ===============================
-//     IO SKIPPER (SAFE)
-// ===============================
-
-func skipIO(r *bytes.Reader) error {
+// parseIOElements reads n1,n2,n4,n8 style IO block and returns an array of maps for each IO
+func parseIOElements(r *bytes.Reader) ([]map[string]interface{}, error) {
 	var n1, n2, n4, n8 byte
+	var ioList []map[string]interface{}
 
 	if err := binary.Read(r, binary.BigEndian, &n1); err != nil {
-		return err
+		return ioList, err
 	}
 	for i := 0; i < int(n1); i++ {
-		r.Seek(2, io.SeekCurrent)
+		var id, val byte
+		if err := binary.Read(r, binary.BigEndian, &id); err != nil {
+			return ioList, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &val); err != nil {
+			return ioList, err
+		}
+		ioList = append(ioList, map[string]interface{}{"id": id, "value": val, "size": 1})
 	}
 
 	if err := binary.Read(r, binary.BigEndian, &n2); err != nil {
-		return err
+		return ioList, err
 	}
 	for i := 0; i < int(n2); i++ {
-		r.Seek(3, io.SeekCurrent)
+		var id byte
+		var v uint16
+		if err := binary.Read(r, binary.BigEndian, &id); err != nil {
+			return ioList, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+			return ioList, err
+		}
+		ioList = append(ioList, map[string]interface{}{"id": id, "value": v, "size": 2})
 	}
 
 	if err := binary.Read(r, binary.BigEndian, &n4); err != nil {
-		return err
+		return ioList, err
 	}
 	for i := 0; i < int(n4); i++ {
-		r.Seek(5, io.SeekCurrent)
+		var id byte
+		var v uint32
+		if err := binary.Read(r, binary.BigEndian, &id); err != nil {
+			return ioList, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+			return ioList, err
+		}
+		ioList = append(ioList, map[string]interface{}{"id": id, "value": v, "size": 4})
 	}
 
 	if err := binary.Read(r, binary.BigEndian, &n8); err != nil {
-		return err
+		return ioList, err
 	}
 	for i := 0; i < int(n8); i++ {
-		r.Seek(9, io.SeekCurrent)
+		var id byte
+		var v uint64
+		if err := binary.Read(r, binary.BigEndian, &id); err != nil {
+			return ioList, err
+		}
+		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+			return ioList, err
+		}
+		ioList = append(ioList, map[string]interface{}{"id": id, "value": v, "size": 8})
 	}
-	return nil
+
+	return ioList, nil
+}
+
+// ===============================
+//  FULL VERBOSE DUMP (per-frame)
+// ===============================
+//
+// DumpCodec8 prints each record, timestamp, lat/lng and IO values in readable form.
+// This is what you asked for when you said "full payload decode for the HEX sent".
+//
+func DumpCodec8(data []byte) {
+	if len(data) < 2 {
+		log.Println("⚠️ DumpCodec8: data too short")
+		return
+	}
+	reader := bytes.NewReader(data)
+	var codecID, recordCount byte
+	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
+		log.Printf("⚠️ DumpCodec8 read codec error: %v", err)
+		return
+	}
+	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
+		log.Printf("⚠️ DumpCodec8 read recordCount error: %v", err)
+		return
+	}
+	log.Printf("🧾 DumpCodec8 codec=0x%X records=%d", codecID, recordCount)
+
+	for i := 0; i < int(recordCount); i++ {
+		start := len(data) - reader.Len()
+		var (
+			timestamp uint64
+			priority  byte
+			lonRaw    int32
+			latRaw    int32
+			alt       uint16
+			angle     uint16
+			sats      byte
+			spd       uint16
+		)
+		if err := binary.Read(reader, binary.BigEndian, &timestamp); err != nil {
+			log.Printf("⚠️ DumpCodec8 read timestamp err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &priority); err != nil {
+			log.Printf("⚠️ DumpCodec8 read priority err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &lonRaw); err != nil {
+			log.Printf("⚠️ DumpCodec8 read lon err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &latRaw); err != nil {
+			log.Printf("⚠️ DumpCodec8 read lat err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &alt); err != nil {
+			log.Printf("⚠️ DumpCodec8 read alt err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &angle); err != nil {
+			log.Printf("⚠️ DumpCodec8 read angle err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &sats); err != nil {
+			log.Printf("⚠️ DumpCodec8 read sats err: %v", err)
+			return
+		}
+		if err := binary.Read(reader, binary.BigEndian, &spd); err != nil {
+			log.Printf("⚠️ DumpCodec8 read speed err: %v", err)
+			return
+		}
+
+		ioStart := len(data) - reader.Len()
+		ioFields, err := parseIOElements(reader)
+		ioEnd := len(data) - reader.Len()
+		if err != nil {
+			log.Printf("⚠️ DumpCodec8 IO parse error: %v", err)
+		}
+
+		rawRec := data[start:ioEnd]
+		ts := int64(timestamp)
+		tm := time.UnixMilli(ts)
+
+		lon := float64(lonRaw) / 1e7
+		lat := float64(latRaw) / 1e7
+
+		log.Println("────────────────────────────────────────────────────────")
+		log.Printf("Record %d/%d", i+1, recordCount)
+		log.Printf(" Raw bytes: %s", hex.EncodeToString(rawRec))
+		log.Printf(" Timestamp(ms): %d -> %s", ts, tm.UTC().Format(time.RFC3339Nano))
+		log.Printf(" Priority: %d", priority)
+		log.Printf(" Lat,Lon: %.7f, %.7f", lat, lon)
+		log.Printf(" Altitude: %d  Angle: %d  Satellites: %d  Speed: %d", alt, angle, sats, spd)
+		if len(ioFields) > 0 {
+			log.Printf(" IO elements (%d):", len(ioFields))
+			for _, it := range ioFields {
+				log.Printf("  - id=%v size=%v value=%v", it["id"], it["size"], it["value"])
+			}
+		} else {
+			log.Printf(" IO elements: none")
+		}
+	}
+
 }
 
 // ===============================
