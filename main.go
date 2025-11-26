@@ -142,21 +142,26 @@ func handleConnection(conn net.Conn) {
 		}
 		if n > 0 {
 			residual = append(residual, tmp[:n]...)
-			log.Printf("🟢 Raw TCP bytes: %s", fmt.Sprintf("%x", tmp[:n]))
+			log.Printf("🟢 Raw TCP bytes: %x", tmp[:n])
 		}
 
+		// parse all complete frames in residual
 		for len(residual) >= 4 {
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
+			if packetLen == 0 {
+				residual = residual[4:]
+				continue
+			}
+
 			if len(residual) < 4+packetLen {
-				break
+				break // wait for more data
 			}
 
 			frame := residual[4 : 4+packetLen]
-
 			records, err := parseCodec8(frame)
 			if err != nil {
-				log.Printf("❌ Frame parse error: %v", err)
-				residual = residual[4+packetLen:]
+				log.Printf("❌ Frame parse error: %v, frame hex: %x", err, frame)
+				residual = residual[4+packetLen:] // skip problematic frame
 				continue
 			}
 
@@ -273,12 +278,12 @@ func parseCodec8(data []byte) ([]*AVLData, error) {
 	for i := 0; i < int(recordCount); i++ {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
-			return records, err
+			return records, fmt.Errorf("error parsing AVL record %d: %v", i, err)
 		}
 		records = append(records, avl)
 	}
 
-	// skip 1 byte for number of records at the end (Codec8)
+	// skip final record count byte
 	var recordCount2 byte
 	_ = binary.Read(reader, binary.BigEndian, &recordCount2)
 
@@ -286,6 +291,10 @@ func parseCodec8(data []byte) ([]*AVLData, error) {
 }
 
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
+	if r.Len() < 28 {
+		return nil, fmt.Errorf("single AVL too short")
+	}
+
 	var timestamp uint64
 	if err := binary.Read(r, binary.BigEndian, &timestamp); err != nil {
 		return nil, err
