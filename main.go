@@ -131,7 +131,7 @@ func handleConnection(conn net.Conn) {
 	}
 
 	var residual []byte
-	tmp := make([]byte, 4096)
+	tmp := make([]byte, 8192)
 
 	for {
 		n, err := conn.Read(tmp)
@@ -147,29 +147,15 @@ func handleConnection(conn net.Conn) {
 		}
 
 		// Process all complete frames
-		for len(residual) >= 12 {
-			if !bytes.HasPrefix(residual, []byte{0, 0, 0, 0}) {
-				residual = residual[1:]
-				continue
-			}
-
+		for len(residual) >= 8 {
 			packetLen := int(binary.BigEndian.Uint32(residual[4:8]))
-			totalLen := 8 + packetLen + 2 // Data field length + CRC16
-
+			totalLen := 8 + packetLen
 			if len(residual) < totalLen {
 				break
 			}
 
-			frame := residual[8 : 8+packetLen]
-			crcBytes := residual[8+packetLen : totalLen]
-
-			if !verifyCRC16(frame, crcBytes) {
-				log.Println("❌ CRC check failed, skipping frame")
-				residual = residual[totalLen:]
-				continue
-			}
-
-			records, err := parseCodec8Data(frame)
+			frame := residual[8:totalLen]
+			records, err := parseCodec8Frame(frame)
 			if err != nil {
 				log.Printf("❌ Frame parse error: %v", err)
 				residual = residual[totalLen:]
@@ -178,12 +164,10 @@ func handleConnection(conn net.Conn) {
 
 			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
 
-			// Store to DB
 			if err := storePositionsBatch(deviceID, imei, records); err != nil {
 				log.Printf("❌ DB batch insert failed: %v", err)
 			}
 
-			// Forward to backend
 			payload := make([]map[string]interface{}, 0, len(records))
 			for _, avl := range records {
 				if avl.Latitude == 0 || avl.Longitude == 0 {
@@ -202,7 +186,6 @@ func handleConnection(conn net.Conn) {
 					"io_data":    avl.IOData,
 				})
 			}
-
 			if err := postPositionsToBackend(payload); err != nil {
 				log.Printf("❌ Failed backend post: %v", err)
 			}
@@ -211,39 +194,6 @@ func handleConnection(conn net.Conn) {
 			residual = residual[totalLen:]
 		}
 	}
-}
-
-// ===============================
-//       CRC16 (Teltonika / IBM)
-// ===============================
-
-func verifyCRC16(data, crcBytes []byte) bool {
-	if len(crcBytes) != 2 {
-		return false
-	}
-	crcExpected := binary.BigEndian.Uint16(crcBytes)
-	crcCalc := crc16IBM(data)
-	if crcExpected != crcCalc {
-		log.Printf("❌ CRC mismatch! Expected: %04X, Actual: %04X", crcExpected, crcCalc)
-		return false
-	}
-	return true
-}
-
-// CRC16-IBM
-func crc16IBM(data []byte) uint16 {
-	var crc uint16 = 0xFFFF
-	for _, b := range data {
-		crc ^= uint16(b)
-		for i := 0; i < 8; i++ {
-			if crc&0x0001 != 0 {
-				crc = (crc >> 1) ^ 0xA001
-			} else {
-				crc >>= 1
-			}
-		}
-	}
-	return crc
 }
 
 // ===============================
@@ -261,7 +211,7 @@ func readIMEI(conn net.Conn) (string, error) {
 	raw := string(buf[:n])
 	re := regexp.MustCompile("\\D")
 	imei := re.ReplaceAllString(raw, "")
-	_, _ = conn.Write([]byte{0x01})
+	_, _ = conn.Write([]byte{0x01}) // Teltonika expects 0x01 after IMEI
 	log.Printf("🔢 Raw IMEI: %q, Cleaned IMEI: %s", raw, imei)
 	return imei, nil
 }
@@ -299,22 +249,25 @@ func ensureDevice(imei string) (int, error) {
 }
 
 // ===============================
-//       PARSE CODEC8 DATA
+//       CODEC8 PARSER
 // ===============================
 
-func parseCodec8Data(data []byte) ([]*AVLData, error) {
-	if len(data) < 2 {
+func parseCodec8Frame(data []byte) ([]*AVLData, error) {
+	if len(data) < 3 {
 		return nil, fmt.Errorf("data too short")
 	}
 	reader := bytes.NewReader(data)
 	var codecID byte
-	binary.Read(reader, binary.BigEndian, &codecID)
-	if codecID != 0x08 {
-		return nil, fmt.Errorf("unexpected codec ID: %02X", codecID)
-	}
-
 	var recordCount byte
-	binary.Read(reader, binary.BigEndian, &recordCount)
+	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
+		return nil, err
+	}
+	if codecID != 0x08 {
+		return nil, fmt.Errorf("unsupported codec %d", codecID)
+	}
+	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
+		return nil, err
+	}
 
 	records := make([]*AVLData, 0, int(recordCount))
 	for i := 0; i < int(recordCount); i++ {
@@ -325,18 +278,13 @@ func parseCodec8Data(data []byte) ([]*AVLData, error) {
 		records = append(records, avl)
 	}
 
-	var recordCount2 byte
-	binary.Read(reader, binary.BigEndian, &recordCount2)
-	if recordCount != recordCount2 {
-		return records, fmt.Errorf("record count mismatch: %d vs %d", recordCount, recordCount2)
+	// Skip record count repeat (1 byte) + CRC16 (2 bytes TCP mode)
+	if _, err := reader.Seek(3, io.SeekCurrent); err != nil {
+		return records, nil
 	}
 
 	return records, nil
 }
-
-// ===============================
-//     PARSE SINGLE AVL
-// ===============================
 
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	var timestamp uint64
@@ -344,7 +292,9 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 		return nil, err
 	}
 	var priority byte
-	_ = binary.Read(r, binary.BigEndian, &priority)
+	if err := binary.Read(r, binary.BigEndian, &priority); err != nil {
+		return nil, err
+	}
 
 	var lonRaw, latRaw int32
 	if err := binary.Read(r, binary.BigEndian, &lonRaw); err != nil {
@@ -358,10 +308,18 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	var angle uint16
 	var satellites byte
 	var speed uint16
-	binary.Read(r, binary.BigEndian, &altitude)
-	binary.Read(r, binary.BigEndian, &angle)
-	binary.Read(r, binary.BigEndian, &satellites)
-	binary.Read(r, binary.BigEndian, &speed)
+	if err := binary.Read(r, binary.BigEndian, &altitude); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &angle); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &satellites); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &speed); err != nil {
+		return nil, err
+	}
 
 	ioData := parseIOElements(r)
 
@@ -378,7 +336,7 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 }
 
 // ===============================
-//     PARSE IO ELEMENTS
+//     IO ELEMENT PARSER
 // ===============================
 
 func parseIOElements(r *bytes.Reader) map[uint8]interface{} {
@@ -489,8 +447,9 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 // ===============================
 
 func sendACK(conn net.Conn, count int) {
-	ack := make([]byte, 4)
+	ack := make([]byte, 5)
 	binary.BigEndian.PutUint32(ack, uint32(count))
+	ack[4] = 0x01
 	_, _ = conn.Write(ack)
 }
 
