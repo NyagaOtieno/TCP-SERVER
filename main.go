@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"log"
 	"net"
@@ -147,6 +146,7 @@ func handleConnection(conn net.Conn) {
 			log.Printf("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 		}
 
+		// Process complete frames
 		for len(residual) >= 12 {
 			packetLen := int(binary.BigEndian.Uint32(residual[4:8]))
 			totalLen := 8 + packetLen + 4
@@ -154,10 +154,9 @@ func handleConnection(conn net.Conn) {
 				break
 			}
 
-			// Extract payload + CRC
-			crcFrame := residual[8 : 8+packetLen+4]
-			if !verifyCRC(crcFrame) {
-				log.Printf("❌ CRC check failed! Expected: %08X, Actual: %08X", binary.BigEndian.Uint32(crcFrame[packetLen:]), crc32.ChecksumIEEE(crcFrame[:packetLen]))
+			frame := residual[8 : 8+packetLen+4] // Data + CRC
+			if !verifyCRC16(frame) {
+				log.Println("❌ CRC check failed, skipping frame")
 				residual = residual[totalLen:]
 				continue
 			}
@@ -208,16 +207,37 @@ func handleConnection(conn net.Conn) {
 }
 
 // ===============================
-//       CRC32 CHECK
+//       CRC16 (Teltonika)
 // ===============================
 
-func verifyCRC(data []byte) bool {
+func verifyCRC16(data []byte) bool {
 	if len(data) < 4 {
 		return false
 	}
 	crcExpected := binary.BigEndian.Uint32(data[len(data)-4:])
-	crcActual := crc32.ChecksumIEEE(data[:len(data)-4])
-	return crcExpected == crcActual
+	crcCalc := crc16(data[:len(data)-4])
+	crcCalc32 := uint32(crcCalc) // expand to 32-bit for comparison
+	if crcExpected != crcCalc32 {
+		log.Printf("❌ CRC mismatch! Expected: %08X, Actual: %08X", crcExpected, crcCalc32)
+		return false
+	}
+	return true
+}
+
+// CRC16/ITU for Teltonika
+func crc16(data []byte) uint16 {
+	var crc uint16 = 0xFFFF
+	for _, b := range data {
+		crc ^= uint16(b)
+		for i := 0; i < 8; i++ {
+			if crc&0x0001 != 0 {
+				crc = (crc >> 1) ^ 0x8408
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return ^crc
 }
 
 // ===============================
