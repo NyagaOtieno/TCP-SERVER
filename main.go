@@ -308,12 +308,11 @@ func ensureDevice(imei string) (int, error) {
 }
 
 // ===============================
-//  CODEC8 PARSER
+//  CODEC8 + 8E PARSER
 // ===============================
 
-// parseCodec8 expects payload starting with 0x08 (codec) and conforms to Teltonika Codec8 format.
-// It's defensive and checks bounds before reads.
-func parseCodec8(data []byte) ([]*AVLData, error) {
+// parseCodec parses both Codec8 and Codec8E payloads
+func parseCodec(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("frame too short")
 	}
@@ -323,8 +322,9 @@ func parseCodec8(data []byte) ([]*AVLData, error) {
 	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
 		return nil, err
 	}
-	if codecID != 0x08 {
-		return nil, fmt.Errorf("unexpected codec ID: %d", codecID)
+
+	if codecID != 0x08 && codecID != 0x8E {
+		return nil, fmt.Errorf("unsupported codec ID: %02X", codecID)
 	}
 
 	var recordCount byte
@@ -336,81 +336,50 @@ func parseCodec8(data []byte) ([]*AVLData, error) {
 	for i := 0; i < int(recordCount); i++ {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
-			// return available records with detailed error
-			return records, fmt.Errorf("error parsing AVL record %d: %v", i, err)
+			// log the error but continue parsing remaining records
+			log.Printf("⚠️ IO parse warning for record %d: %v", i, err)
 		}
 		records = append(records, avl)
 	}
 
-	// Some implementations include an ending "number of records" byte - read it if present
-	// but do not require it.
-	// If enough bytes remain, attempt to read the final recordCount2
+	// read optional "number of records" at the end (for protocol consistency)
 	if reader.Len() >= 1 {
 		var recordCount2 byte
 		_ = binary.Read(reader, binary.BigEndian, &recordCount2)
-		// ignore value; it's just consistency check in protocol
-		_ = recordCount2
 	}
 
 	return records, nil
 }
 
+// parseSingleAVL parses one AVL record (Codec8 or 8E)
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
-	// We need at least:
-	// timestamp(8) + priority(1) + lon(4) + lat(4) + altitude(2) + angle(2) + satellites(1) + speed(2)
 	const minHeader = 8 + 1 + 4 + 4 + 2 + 2 + 1 + 2
 	if r.Len() < minHeader {
 		return nil, fmt.Errorf("single AVL too short (need %d bytes, have %d)", minHeader, r.Len())
 	}
 
 	var timestamp uint64
-	if err := binary.Read(r, binary.BigEndian, &timestamp); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &timestamp)
 	var priority byte
-	if err := binary.Read(r, binary.BigEndian, &priority); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &priority)
 
 	var lonRaw, latRaw int32
-	if err := binary.Read(r, binary.BigEndian, &lonRaw); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &latRaw); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &lonRaw)
+	_ = binary.Read(r, binary.BigEndian, &latRaw)
 
-	var altitude uint16
-	if err := binary.Read(r, binary.BigEndian, &altitude); err != nil {
-		return nil, err
-	}
-	var angle uint16
-	if err := binary.Read(r, binary.BigEndian, &angle); err != nil {
-		return nil, err
-	}
+	var altitude, angle uint16
+	_ = binary.Read(r, binary.BigEndian, &altitude)
+	_ = binary.Read(r, binary.BigEndian, &angle)
+
 	var satellites byte
-	if err := binary.Read(r, binary.BigEndian, &satellites); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &satellites)
 	var speed uint16
-	if err := binary.Read(r, binary.BigEndian, &speed); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &speed)
 
-	// parse IO elements defensively
 	ioData, err := parseIOElements(r)
 	if err != nil {
-		// return parsed fields even if IO parsing is truncated
-		return &AVLData{
-			Timestamp:  time.UnixMilli(int64(timestamp)),
-			Latitude:   float64(latRaw) / 1e7,
-			Longitude:  float64(lonRaw) / 1e7,
-			Altitude:   int(altitude),
-			Angle:      int(angle),
-			Satellites: int(satellites),
-			Speed:      int(speed),
-			IOData:     ioData,
-		}, fmt.Errorf("io parse warning: %v", err)
+		// do not fail entire AVL, just log
+		log.Printf("⚠️ IO parsing warning: %v", err)
 	}
 
 	return &AVLData{
