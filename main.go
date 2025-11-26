@@ -150,23 +150,20 @@ func handleConnection(conn net.Conn) {
 		}
 
 		// Process all complete frames in residual
-		for len(residual) >= 12 { // minimum Teltonika header
-			packetLen := int(binary.BigEndian.Uint32(residual[4:8]))
-			totalLen := 8 + packetLen + 4 // 8 header + data + 4 CRC
+		for len(residual) >= 12 { // minimum 12 bytes to read header + length
+			dataLen := int(binary.BigEndian.Uint32(residual[4:8]))
+			totalLen := 8 + dataLen + 4 // header + data + CRC
 			if len(residual) < totalLen {
 				break // wait for more bytes
 			}
 
-			frame := residual[8 : 8+packetLen+4] // AVL + CRC
-
-			// CRC check
+			frame := residual[8 : 8+dataLen+4] // AVL + CRC
 			if !verifyCRC(frame) {
 				log.Printf("❌ CRC check failed for frame, discarding")
-				residual = residual[totalLen:] // skip this frame and continue
+				residual = residual[totalLen:]
 				continue
 			}
 
-			// Parse AVL data
 			records, err := parseTeltonikaDataField(frame[:len(frame)-4])
 			if err != nil {
 				log.Printf("❌ Frame parse error: %v", err)
@@ -176,7 +173,6 @@ func handleConnection(conn net.Conn) {
 
 			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
 
-			// Store to DB
 			if err := storePositionsBatch(deviceID, imei, records); err != nil {
 				log.Printf("❌ DB batch insert failed: %v", err)
 			}
@@ -200,7 +196,6 @@ func handleConnection(conn net.Conn) {
 					"io_data":    avl.IOData,
 				})
 			}
-
 			if err := postPositionsToBackend(payload); err != nil {
 				log.Printf("❌ Failed backend post: %v", err)
 			}
@@ -228,26 +223,6 @@ func verifyCRC(frame []byte) bool {
 		log.Printf("❌ CRC mismatch! Expected: %08X, Actual: %08X, len(content)=%d", expected, actual, len(content))
 	}
 	return expected == actual
-}
-
-// ===============================
-//    TELTONIKA FRAME EXTRACTOR
-// ===============================
-
-func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
-	if len(buf) < 12 {
-		return nil, 0, false
-	}
-
-	// first 8 bytes are zeros + length
-	dataLen := int(binary.BigEndian.Uint32(buf[4:8]))
-	total := 8 + dataLen + 4 // +4 for CRC
-	if len(buf) < total {
-		return nil, 0, false
-	}
-
-	frame = buf[8 : 8+dataLen+4] // exactly AVL + CRC
-	return frame, total, true
 }
 
 // ===============================
