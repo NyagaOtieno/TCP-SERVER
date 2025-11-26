@@ -51,7 +51,6 @@ var (
 	httpClient      = &http.Client{Timeout: 10 * time.Second}
 	wg              sync.WaitGroup
 
-	// feature flags
 	positionsHasIoData bool
 )
 
@@ -85,7 +84,6 @@ func init() {
 	}
 	log.Println("✅ PostgreSQL connected successfully")
 
-	// detect whether positions.io_data exists (avoid runtime pq error)
 	positionsHasIoData = checkPositionsHasIoData()
 	if positionsHasIoData {
 		log.Println("ℹ️ positions.io_data column detected; will store IO JSON")
@@ -100,7 +98,6 @@ func checkPositionsHasIoData() bool {
 		`SELECT column_name FROM information_schema.columns
 		 WHERE table_name='positions' AND column_name='io_data' LIMIT 1`).Scan(&col)
 	if err != nil {
-		// if no rows, err is sql.ErrNoRows -> treat as missing
 		return false
 	}
 	return col == "io_data"
@@ -149,7 +146,6 @@ func handleConnection(conn net.Conn) {
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
 		log.Printf("❌ Device lookup failed: %v", err)
-		// still continue — device may be unknown; you can decide to return here if needed
 		return
 	}
 
@@ -169,43 +165,34 @@ func handleConnection(conn net.Conn) {
 			log.Printf("🟢 Raw TCP bytes: %x", tmp[:n])
 		}
 
-		// parse all complete frames in residual
 		for len(residual) >= 4 {
-			// typical Teltonika frame: 4 bytes length, then payload (length bytes)
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
-			// guard against invalid lengths
 			if packetLen <= 0 || packetLen > 10*1024*1024 {
-				// weird length, skip these 4 bytes and continue
 				log.Printf("⚠️ invalid packet length %d, skipping 4 bytes", packetLen)
 				residual = residual[4:]
 				continue
 			}
 
 			if len(residual) < 4+packetLen {
-				// incomplete frame; wait for more data
 				break
 			}
 
 			frame := residual[4 : 4+packetLen]
-
-			// Normalize frame: ensure we feed parseCodec8 with codec payload. Some devices include extra header/trailer.
 			codecPayload, err := normalizeToCodec8(frame)
 			if err != nil {
 				log.Printf("❌ Frame normalization failed: %v, frame hex: %x", err, frame)
-				// skip this frame so we don't loop forever
 				residual = residual[4+packetLen:]
 				continue
 			}
 
-			records, err := parseCodec8(codecPayload)
+			records, err := parseCodec(codecPayload)
 			if err != nil {
 				log.Printf("❌ Frame parse error: %v, frame hex: %x", err, codecPayload)
-				residual = residual[4+packetLen:] // skip problematic frame
+				residual = residual[4+packetLen:]
 				continue
 			}
 
 			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
-
 			if err := storePositionsBatch(deviceID, imei, records); err != nil {
 				log.Printf("❌ DB batch insert failed: %v", err)
 			}
@@ -239,15 +226,11 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// normalizeToCodec8 attempts to find the codec8 payload inside a raw frame
-// It returns a slice starting at codec byte (0x08) and ending before CRC/final bytes if present.
-// This makes parsing resilient to small format differences.
+// normalizeToCodec8 ensures the payload starts with 0x08
 func normalizeToCodec8(frame []byte) ([]byte, error) {
-	// If frame already starts with codec 0x08, return it
 	if len(frame) > 0 && frame[0] == 0x08 {
 		return frame, nil
 	}
-	// Otherwise search for first occurrence of 0x08
 	idx := bytes.IndexByte(frame, 0x08)
 	if idx == -1 {
 		return nil, fmt.Errorf("codec 0x08 not found in frame")
@@ -311,7 +294,6 @@ func ensureDevice(imei string) (int, error) {
 //  CODEC8 + 8E PARSER
 // ===============================
 
-// parseCodec parses both Codec8 and Codec8E payloads
 func parseCodec(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("frame too short")
@@ -336,13 +318,11 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 	for i := 0; i < int(recordCount); i++ {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
-			// log the error but continue parsing remaining records
 			log.Printf("⚠️ IO parse warning for record %d: %v", i, err)
 		}
 		records = append(records, avl)
 	}
 
-	// read optional "number of records" at the end (for protocol consistency)
 	if reader.Len() >= 1 {
 		var recordCount2 byte
 		_ = binary.Read(reader, binary.BigEndian, &recordCount2)
@@ -351,7 +331,6 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 	return records, nil
 }
 
-// parseSingleAVL parses one AVL record (Codec8 or 8E)
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	const minHeader = 8 + 1 + 4 + 4 + 2 + 2 + 1 + 2
 	if r.Len() < minHeader {
@@ -378,7 +357,6 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 
 	ioData, err := parseIOElements(r)
 	if err != nil {
-		// do not fail entire AVL, just log
 		log.Printf("⚠️ IO parsing warning: %v", err)
 	}
 
@@ -394,19 +372,14 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	}, nil
 }
 
-// parseIOElements reads IO structure but is careful with bounds and returns partial ioData + error if truncated.
 func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	ioData := make(map[uint8]interface{})
 
-	// Check we have at least 1 byte for "n1" count (or return empty)
 	if r.Len() < 1 {
 		return ioData, fmt.Errorf("io: missing n1")
 	}
 	var n1 byte
-	if err := binary.Read(r, binary.BigEndian, &n1); err != nil {
-		return ioData, err
-	}
-	// n1 entries: id(1) + value(1)
+	_ = binary.Read(r, binary.BigEndian, &n1)
 	for i := 0; i < int(n1); i++ {
 		if r.Len() < 2 {
 			return ioData, fmt.Errorf("io: truncated n1 element")
@@ -417,7 +390,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// n2
 	if r.Len() < 1 {
 		return ioData, fmt.Errorf("io: missing n2")
 	}
@@ -434,7 +406,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// n4
 	if r.Len() < 1 {
 		return ioData, fmt.Errorf("io: missing n4")
 	}
@@ -451,9 +422,8 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// n8
 	if r.Len() < 1 {
-		return ioData, nil // it's ok to have no n8; return nil error
+		return ioData, nil
 	}
 	var n8 byte
 	_ = binary.Read(r, binary.BigEndian, &n8)
@@ -486,7 +456,6 @@ func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 	}
 	defer tx.Rollback()
 
-	// Choose statement depending on whether io_data exists
 	var stmt *sql.Stmt
 	if positionsHasIoData {
 		stmt, err = tx.Prepare(`
@@ -509,7 +478,6 @@ func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 			continue
 		}
 		if positionsHasIoData {
-			// marshal io to JSON for storage
 			ioJSON, _ := json.Marshal(r.IOData)
 			_, _ = stmt.Exec(
 				deviceID, r.Latitude, r.Longitude, r.Speed,
