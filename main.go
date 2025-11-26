@@ -146,23 +146,30 @@ func handleConnection(conn net.Conn) {
 			log.Printf("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 		}
 
-		// Process complete frames
+		// Process all complete frames
 		for len(residual) >= 12 {
+			if !bytes.HasPrefix(residual, []byte{0, 0, 0, 0}) {
+				residual = residual[1:]
+				continue
+			}
+
 			packetLen := int(binary.BigEndian.Uint32(residual[4:8]))
-			totalLen := 8 + packetLen + 4
+			totalLen := 8 + packetLen + 2 // Data field length + CRC16
+
 			if len(residual) < totalLen {
 				break
 			}
 
-			frame := residual[8 : 8+packetLen+4] // Data + CRC
-			if !verifyCRC16(frame) {
+			frame := residual[8 : 8+packetLen]
+			crcBytes := residual[8+packetLen : totalLen]
+
+			if !verifyCRC16(frame, crcBytes) {
 				log.Println("❌ CRC check failed, skipping frame")
 				residual = residual[totalLen:]
 				continue
 			}
 
-			avlData := residual[8 : 8+packetLen]
-			records, err := parseTeltonikaDataField(avlData)
+			records, err := parseCodec8Data(frame)
 			if err != nil {
 				log.Printf("❌ Frame parse error: %v", err)
 				residual = residual[totalLen:]
@@ -207,37 +214,36 @@ func handleConnection(conn net.Conn) {
 }
 
 // ===============================
-//       CRC16 (Teltonika)
+//       CRC16 (Teltonika / IBM)
 // ===============================
 
-func verifyCRC16(data []byte) bool {
-	if len(data) < 4 {
+func verifyCRC16(data, crcBytes []byte) bool {
+	if len(crcBytes) != 2 {
 		return false
 	}
-	crcExpected := binary.BigEndian.Uint32(data[len(data)-4:])
-	crcCalc := crc16(data[:len(data)-4])
-	crcCalc32 := uint32(crcCalc) // expand to 32-bit for comparison
-	if crcExpected != crcCalc32 {
-		log.Printf("❌ CRC mismatch! Expected: %08X, Actual: %08X", crcExpected, crcCalc32)
+	crcExpected := binary.BigEndian.Uint16(crcBytes)
+	crcCalc := crc16IBM(data)
+	if crcExpected != crcCalc {
+		log.Printf("❌ CRC mismatch! Expected: %04X, Actual: %04X", crcExpected, crcCalc)
 		return false
 	}
 	return true
 }
 
-// CRC16/ITU for Teltonika
-func crc16(data []byte) uint16 {
+// CRC16-IBM
+func crc16IBM(data []byte) uint16 {
 	var crc uint16 = 0xFFFF
 	for _, b := range data {
 		crc ^= uint16(b)
 		for i := 0; i < 8; i++ {
 			if crc&0x0001 != 0 {
-				crc = (crc >> 1) ^ 0x8408
+				crc = (crc >> 1) ^ 0xA001
 			} else {
 				crc >>= 1
 			}
 		}
 	}
-	return ^crc
+	return crc
 }
 
 // ===============================
@@ -293,22 +299,22 @@ func ensureDevice(imei string) (int, error) {
 }
 
 // ===============================
-//  TELTONIKA DATA PARSER
+//       PARSE CODEC8 DATA
 // ===============================
 
-func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
+func parseCodec8Data(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("data too short")
 	}
 	reader := bytes.NewReader(data)
 	var codecID byte
+	binary.Read(reader, binary.BigEndian, &codecID)
+	if codecID != 0x08 {
+		return nil, fmt.Errorf("unexpected codec ID: %02X", codecID)
+	}
+
 	var recordCount byte
-	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
-		return nil, err
-	}
+	binary.Read(reader, binary.BigEndian, &recordCount)
 
 	records := make([]*AVLData, 0, int(recordCount))
 	for i := 0; i < int(recordCount); i++ {
@@ -318,8 +324,19 @@ func parseTeltonikaDataField(data []byte) ([]*AVLData, error) {
 		}
 		records = append(records, avl)
 	}
+
+	var recordCount2 byte
+	binary.Read(reader, binary.BigEndian, &recordCount2)
+	if recordCount != recordCount2 {
+		return records, fmt.Errorf("record count mismatch: %d vs %d", recordCount, recordCount2)
+	}
+
 	return records, nil
 }
+
+// ===============================
+//     PARSE SINGLE AVL
+// ===============================
 
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	var timestamp uint64
@@ -361,7 +378,7 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 }
 
 // ===============================
-//     IO ELEMENT PARSER
+//     PARSE IO ELEMENTS
 // ===============================
 
 func parseIOElements(r *bytes.Reader) map[uint8]interface{} {
@@ -472,9 +489,8 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 // ===============================
 
 func sendACK(conn net.Conn, count int) {
-	ack := make([]byte, 5)
+	ack := make([]byte, 4)
 	binary.BigEndian.PutUint32(ack, uint32(count))
-	ack[4] = 0x01
 	_, _ = conn.Write(ack)
 }
 
