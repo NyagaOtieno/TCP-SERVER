@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -130,8 +129,8 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	var residual []byte
-	tmp := make([]byte, 8192)
+	residual := make([]byte, 0)
+	tmp := make([]byte, 4096)
 
 	for {
 		n, err := conn.Read(tmp)
@@ -143,22 +142,21 @@ func handleConnection(conn net.Conn) {
 		}
 		if n > 0 {
 			residual = append(residual, tmp[:n]...)
-			log.Printf("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
+			log.Printf("🟢 Raw TCP bytes: %s", fmt.Sprintf("%x", tmp[:n]))
 		}
 
-		// Process all complete frames
-		for len(residual) >= 8 {
-			packetLen := int(binary.BigEndian.Uint32(residual[4:8]))
-			totalLen := 8 + packetLen
-			if len(residual) < totalLen {
+		for len(residual) >= 4 {
+			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
+			if len(residual) < 4+packetLen {
 				break
 			}
 
-			frame := residual[8:totalLen]
-			records, err := parseCodec8Frame(frame)
+			frame := residual[4 : 4+packetLen]
+
+			records, err := parseCodec8(frame)
 			if err != nil {
 				log.Printf("❌ Frame parse error: %v", err)
-				residual = residual[totalLen:]
+				residual = residual[4+packetLen:]
 				continue
 			}
 
@@ -186,12 +184,13 @@ func handleConnection(conn net.Conn) {
 					"io_data":    avl.IOData,
 				})
 			}
+
 			if err := postPositionsToBackend(payload); err != nil {
 				log.Printf("❌ Failed backend post: %v", err)
 			}
 
 			sendACK(conn, len(records))
-			residual = residual[totalLen:]
+			residual = residual[4+packetLen:]
 		}
 	}
 }
@@ -211,7 +210,7 @@ func readIMEI(conn net.Conn) (string, error) {
 	raw := string(buf[:n])
 	re := regexp.MustCompile("\\D")
 	imei := re.ReplaceAllString(raw, "")
-	_, _ = conn.Write([]byte{0x01}) // Teltonika expects 0x01 after IMEI
+	_, _ = conn.Write([]byte{0x01})
 	log.Printf("🔢 Raw IMEI: %q, Cleaned IMEI: %s", raw, imei)
 	return imei, nil
 }
@@ -249,21 +248,22 @@ func ensureDevice(imei string) (int, error) {
 }
 
 // ===============================
-//       CODEC8 PARSER
+//  CODEC8 PARSER
 // ===============================
 
-func parseCodec8Frame(data []byte) ([]*AVLData, error) {
-	if len(data) < 3 {
-		return nil, fmt.Errorf("data too short")
+func parseCodec8(data []byte) ([]*AVLData, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("frame too short")
 	}
 	reader := bytes.NewReader(data)
+
 	var codecID byte
 	var recordCount byte
 	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
 		return nil, err
 	}
 	if codecID != 0x08 {
-		return nil, fmt.Errorf("unsupported codec %d", codecID)
+		return nil, fmt.Errorf("unexpected codec ID: %d", codecID)
 	}
 	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
 		return nil, err
@@ -278,10 +278,9 @@ func parseCodec8Frame(data []byte) ([]*AVLData, error) {
 		records = append(records, avl)
 	}
 
-	// Skip record count repeat (1 byte) + CRC16 (2 bytes TCP mode)
-	if _, err := reader.Seek(3, io.SeekCurrent); err != nil {
-		return records, nil
-	}
+	// skip 1 byte for number of records at the end (Codec8)
+	var recordCount2 byte
+	_ = binary.Read(reader, binary.BigEndian, &recordCount2)
 
 	return records, nil
 }
@@ -292,9 +291,7 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 		return nil, err
 	}
 	var priority byte
-	if err := binary.Read(r, binary.BigEndian, &priority); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &priority)
 
 	var lonRaw, latRaw int32
 	if err := binary.Read(r, binary.BigEndian, &lonRaw); err != nil {
@@ -308,18 +305,10 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	var angle uint16
 	var satellites byte
 	var speed uint16
-	if err := binary.Read(r, binary.BigEndian, &altitude); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &angle); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &satellites); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, binary.BigEndian, &speed); err != nil {
-		return nil, err
-	}
+	binary.Read(r, binary.BigEndian, &altitude)
+	binary.Read(r, binary.BigEndian, &angle)
+	binary.Read(r, binary.BigEndian, &satellites)
+	binary.Read(r, binary.BigEndian, &speed)
 
 	ioData := parseIOElements(r)
 
