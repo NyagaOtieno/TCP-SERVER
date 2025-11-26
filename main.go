@@ -131,7 +131,8 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	buf := make([]byte, 0, 8192)
+	// Residual buffer for fragmented frames
+	var residual []byte
 	tmp := make([]byte, 4096)
 
 	for {
@@ -144,62 +145,60 @@ func handleConnection(conn net.Conn) {
 		}
 
 		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+			residual = append(residual, tmp[:n]...)
 			log.Printf("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 		}
 
-		for {
-			frame, frameLen, ok := extractTeltonikaFrame(buf)
-			if !ok {
-				break
+		// Process all complete frames in residual
+		for len(residual) > 12 {
+			packetLen := int(binary.BigEndian.Uint32(residual[4:8]))
+			totalLen := 8 + packetLen + 4
+			if len(residual) < totalLen {
+				break // wait for more bytes
 			}
 
-			buf = buf[frameLen:]
-
-			// CRC Check
+			frame := residual[8 : 8+packetLen+4] // AVL + CRC
 			if !verifyCRC(frame) {
-				log.Printf("❌ CRC check failed, discarding frame")
-				continue
-			}
+				log.Println("❌ CRC check failed for frame, discarding")
+			} else {
+				records, err := parseTeltonikaDataField(frame[:len(frame)-4])
+				if err != nil {
+					log.Printf("❌ Frame parse error: %v", err)
+				} else {
+					log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
+					if err := storePositionsBatch(deviceID, imei, records); err != nil {
+						log.Printf("❌ DB batch insert failed: %v", err)
+					}
 
-			records, err := parseTeltonikaDataField(frame)
-			if err != nil {
-				log.Printf("❌ Frame parse error: %v", err)
-				continue
-			}
+					// Forward to backend
+					payload := make([]map[string]interface{}, 0, len(records))
+					for _, avl := range records {
+						if avl.Latitude == 0 || avl.Longitude == 0 {
+							continue
+						}
+						payload = append(payload, map[string]interface{}{
+							"device_id":  deviceID,
+							"imei":       imei,
+							"timestamp":  avl.Timestamp.Format(time.RFC3339),
+							"latitude":   avl.Latitude,
+							"longitude":  avl.Longitude,
+							"speed":      avl.Speed,
+							"angle":      avl.Angle,
+							"altitude":   avl.Altitude,
+							"satellites": avl.Satellites,
+							"io_data":    avl.IOData,
+						})
+					}
+					if err := postPositionsToBackend(payload); err != nil {
+						log.Printf("❌ Failed backend post: %v", err)
+					}
 
-			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
-
-			// DB insert
-			if err := storePositionsBatch(deviceID, imei, records); err != nil {
-				log.Printf("❌ DB batch insert failed: %v", err)
-			}
-
-			// Forward to backend
-			payload := make([]map[string]interface{}, 0, len(records))
-			for _, avl := range records {
-				if avl.Latitude == 0 || avl.Longitude == 0 {
-					continue
+					sendACK(conn, len(records))
 				}
-				payload = append(payload, map[string]interface{}{
-					"device_id":  deviceID,
-					"imei":       imei,
-					"timestamp":  avl.Timestamp.Format(time.RFC3339),
-					"latitude":   avl.Latitude,
-					"longitude":  avl.Longitude,
-					"speed":      avl.Speed,
-					"angle":      avl.Angle,
-					"altitude":   avl.Altitude,
-					"satellites": avl.Satellites,
-					"io_data":    avl.IOData,
-				})
 			}
 
-			if err := postPositionsToBackend(payload); err != nil {
-				log.Printf("❌ Failed backend post: %v", err)
-			}
-
-			sendACK(conn, len(records))
+			// Move to next frame
+			residual = residual[totalLen:]
 		}
 	}
 }
@@ -242,7 +241,6 @@ func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
 	frame = buf[8 : 8+dataLen+4] // exactly AVL + CRC
 	return frame, total, true
 }
-
 
 // ===============================
 //       IMEI READER
