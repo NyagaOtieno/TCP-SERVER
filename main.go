@@ -192,16 +192,20 @@ func handleConnection(conn net.Conn) {
 				continue
 			}
 
-			log.Printf("🔎 Parsed %d AVL record(s) for %s", len(records), imei)
-			if err := storePositionsBatch(deviceID, imei, records); err != nil {
+			validRecords := make([]*AVLData, 0, len(records))
+			for _, r := range records {
+				if r != nil && r.Latitude != 0 && r.Longitude != 0 {
+					validRecords = append(validRecords, r)
+				}
+			}
+
+			log.Printf("🔎 Parsed %d valid AVL record(s) for %s", len(validRecords), imei)
+			if err := storePositionsBatch(deviceID, imei, validRecords); err != nil {
 				log.Printf("❌ DB batch insert failed: %v", err)
 			}
 
-			payload := make([]map[string]interface{}, 0, len(records))
-			for _, avl := range records {
-				if avl.Latitude == 0 || avl.Longitude == 0 {
-					continue
-				}
+			payload := make([]map[string]interface{}, 0, len(validRecords))
+			for _, avl := range validRecords {
 				payload = append(payload, map[string]interface{}{
 					"device_id":  deviceID,
 					"imei":       imei,
@@ -220,7 +224,7 @@ func handleConnection(conn net.Conn) {
 				log.Printf("❌ Failed backend post: %v", err)
 			}
 
-			sendACK(conn, len(records))
+			sendACK(conn, len(validRecords))
 			residual = residual[4+packetLen:]
 		}
 	}
@@ -319,8 +323,11 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
 			log.Printf("⚠️ IO parse warning for record %d: %v", i, err)
+			continue
 		}
-		records = append(records, avl)
+		if avl != nil {
+			records = append(records, avl)
+		}
 	}
 
 	if reader.Len() >= 1 {
