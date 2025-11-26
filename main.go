@@ -208,13 +208,18 @@ func handleConnection(conn net.Conn) {
 //       CRC32 CHECK
 // ===============================
 
-func verifyCRC(data []byte) bool {
-	if len(data) < 4 {
+func verifyCRC(frame []byte) bool {
+	if len(frame) < 4 {
 		return false
 	}
-	content := data[:len(data)-4]
-	expected := binary.BigEndian.Uint32(data[len(data)-4:])
+
+	expected := binary.BigEndian.Uint32(frame[len(frame)-4:])
+	content := frame[:len(frame)-4]
+
 	actual := crc32.ChecksumIEEE(content)
+	if expected != actual {
+		log.Printf("❌ CRC mismatch! Expected: %08X, Actual: %08X, len(content)=%d", expected, actual, len(content))
+	}
 	return expected == actual
 }
 
@@ -226,17 +231,18 @@ func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
 	if len(buf) < 12 {
 		return nil, 0, false
 	}
-	if !(buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0) {
-		return nil, 0, false
-	}
+
+	// first 8 bytes are zeros + length
 	dataLen := int(binary.BigEndian.Uint32(buf[4:8]))
-	total := 8 + dataLen + 4
+	total := 8 + dataLen + 4 // +4 for CRC
 	if len(buf) < total {
 		return nil, 0, false
 	}
-	data := buf[8 : 8+dataLen+4] // include CRC for verify
-	return data, total, true
+
+	frame = buf[8 : 8+dataLen+4] // exactly AVL + CRC
+	return frame, total, true
 }
+
 
 // ===============================
 //       IMEI READER
