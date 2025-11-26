@@ -36,8 +36,8 @@ type AVLData struct {
 
 // Device struct for backend lookup
 type Device struct {
-	ID   int    json:"id"
-	IMEI string json:"imei"
+	ID   int    `json:"id"`
+	IMEI string `json:"imei"`
 }
 
 // =======================
@@ -227,7 +227,7 @@ func extractTeltonikaFrame(buf []byte) (frame []byte, frameLen int, ok bool) {
 				// caller should drop i bytes first; return ok==false and frameLen==i so caller can drop
 				// but since our caller does not act on frameLen when ok==false, return (nil,0,false)
 				// and let the caller wait for more data — but to avoid buffer growth we can drop the prefix here:
-				// however to be safe we return (nil,i,false) and the caller will still break; the buffer isn't auto-trimmed by caller.
+				// however to be safe we return nil, i, false and the caller will still break; the buffer isn't auto-trimmed by caller.
 				// To keep behavior simple: return nil,0,false and let the caller append more bytes.
 				// (Alternatively you could return the index so caller could trim.)
 				return nil, i, false
