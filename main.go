@@ -5,9 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,7 +18,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// AVLData represents a GPS/IO record
 type AVLData struct {
 	Timestamp  time.Time              `json:"timestamp"`
 	Latitude   float64                `json:"latitude"`
@@ -32,7 +29,6 @@ type AVLData struct {
 	IOData     map[uint8]interface{} `json:"io_data,omitempty"`
 }
 
-// Device represents a registered device
 type Device struct {
 	ID   int    `json:"id"`
 	IMEI string `json:"imei"`
@@ -48,23 +44,19 @@ var (
 )
 
 func init() {
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
 	_ = godotenv.Load()
-
 	tcpServerHost = getEnv("TCP_SERVER_HOST", "0.0.0.0:5027")
 	backendTrackURL = getEnv("BACKEND_TRACK_URL", "https://mytrack-production.up.railway.app/api/track")
 
 	pgURL := getEnv("DATABASE_URL", "")
 	if pgURL == "" {
-		log.Fatal("❌ DATABASE_URL not set")
+		os.Exit(1)
 	}
 
 	var err error
 	db, err = sql.Open("postgres", pgURL)
 	if err != nil {
-		log.Fatalf("❌ Failed to open PostgreSQL connection: %v", err)
+		os.Exit(1)
 	}
 
 	db.SetMaxOpenConns(20)
@@ -72,16 +64,10 @@ func init() {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err = db.Ping(); err != nil {
-		log.Fatalf("❌ PostgreSQL ping failed: %v", err)
+		os.Exit(1)
 	}
-	log.Println("✅ PostgreSQL connected successfully")
 
 	positionsHasIoData = checkPositionsHasIoData()
-	if positionsHasIoData {
-		log.Println("ℹ️ positions.io_data column detected; will store IO JSON")
-	} else {
-		log.Println("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
-	}
 }
 
 func checkPositionsHasIoData() bool {
@@ -94,31 +80,22 @@ func checkPositionsHasIoData() bool {
 }
 
 func main() {
-	log.Println("🚀 Starting Teltonika TCP Server...")
-
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
-		log.Fatalf("❌ Failed to start TCP server: %v", err)
+		os.Exit(1)
 	}
 	defer listener.Close()
-
-	log.Printf("✅ TCP Server listening on %s", tcpServerHost)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("⚠️ Accept error:", err)
 			continue
 		}
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("🔥 Panic recovered: %v", r)
-				}
-			}()
+			defer func() { recover() }()
 			handleConnection(c)
 		}(conn)
 	}
@@ -127,19 +104,13 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	remote := conn.RemoteAddr().String()
-	log.Printf("🔗 New connection from %s", remote)
-
 	imei, err := readIMEI(conn)
 	if err != nil {
-		log.Printf("❌ Failed to read IMEI: %v", err)
 		return
 	}
-	log.Printf("📡 Device connected: %s", imei)
 
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
-		log.Printf("❌ Device lookup failed: %v", err)
 		return
 	}
 
@@ -150,11 +121,6 @@ func handleConnection(conn net.Conn) {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := conn.Read(tmp)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				log.Printf("⏱ Read timeout for %s, closing connection", imei)
-			} else if err != io.EOF {
-				log.Printf("🔌 Read error for %s: %v", imei, err)
-			}
 			return
 		}
 
@@ -162,7 +128,6 @@ func handleConnection(conn net.Conn) {
 			residual = append(residual, tmp[:n]...)
 		}
 
-		// TCP framing: 4-byte length prefix
 		for {
 			if len(residual) < 4 {
 				break
@@ -170,13 +135,12 @@ func handleConnection(conn net.Conn) {
 
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
 			if packetLen <= 0 || packetLen > 10*1024*1024 {
-				log.Printf("⚠️ Invalid packet length %d, skipping first byte", packetLen)
 				residual = residual[1:]
 				continue
 			}
 
 			if len(residual) < 4+packetLen {
-				break // wait for more data
+				break
 			}
 
 			frame := residual[4 : 4+packetLen]
@@ -184,27 +148,17 @@ func handleConnection(conn net.Conn) {
 
 			codecPayload, err := normalizeToCodec8(frame)
 			if err != nil {
-				log.Printf("❌ Codec normalization failed: %v", err)
 				continue
 			}
 
 			records, err := parseCodec(codecPayload)
 			if err != nil {
-				log.Printf("❌ Codec parse failed: %v", err)
 				continue
 			}
 
 			validRecords := filterValidRecords(records)
-			log.Printf("🔎 Parsed %d valid AVL record(s) for %s", len(validRecords), imei)
-
-			if err := storePositionsBatch(deviceID, imei, validRecords); err != nil {
-				log.Printf("❌ DB batch insert failed: %v", err)
-			}
-
-			if err := postPositionsToBackend(validRecords, deviceID, imei); err != nil {
-				log.Printf("❌ Backend post failed: %v", err)
-			}
-
+			storePositionsBatch(deviceID, imei, validRecords)
+			postPositionsToBackend(validRecords, deviceID, imei)
 			sendACK(conn, len(validRecords))
 		}
 	}
@@ -212,7 +166,7 @@ func handleConnection(conn net.Conn) {
 
 func normalizeToCodec8(frame []byte) ([]byte, error) {
 	if len(frame) == 0 {
-		return nil, fmt.Errorf("empty frame")
+		return nil, io.EOF
 	}
 	if frame[0] == 0x08 || frame[0] == 0x8E {
 		return frame, nil
@@ -221,7 +175,7 @@ func normalizeToCodec8(frame []byte) ([]byte, error) {
 	if idx == -1 {
 		idx = bytes.IndexByte(frame, 0x8E)
 		if idx == -1 {
-			return nil, fmt.Errorf("codec8 not found")
+			return nil, io.EOF
 		}
 	}
 	return frame[idx:], nil
@@ -243,8 +197,7 @@ func readIMEI(conn net.Conn) (string, error) {
 
 	re := regexp.MustCompile(`\D`)
 	imei := re.ReplaceAllString(string(raw), "")
-	_, _ = conn.Write([]byte{0x01})
-	log.Printf("🔢 Raw IMEI: %q, Cleaned IMEI: %s", string(raw), imei)
+	conn.Write([]byte{0x01})
 	return imei, nil
 }
 
@@ -257,51 +210,40 @@ func ensureDevice(imei string) (int, error) {
 
 	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
 	if err != nil {
-		return 0, fmt.Errorf("GET devices list failed: %v", err)
+		return 0, err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	var devices []Device
-	if err := json.Unmarshal(body, &devices); err != nil {
-		return 0, fmt.Errorf("unmarshal devices failed: %v", err)
-	}
+	json.Unmarshal(body, &devices)
 
 	for _, d := range devices {
 		if strings.TrimSpace(d.IMEI) == imei {
-			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
+			db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
 			return d.ID, nil
 		}
 	}
-
-	return 0, fmt.Errorf("device IMEI %s not found", imei)
+	return 0, io.EOF
 }
 
 func parseCodec(data []byte) ([]*AVLData, error) {
 	if len(data) < 2 {
-		return nil, fmt.Errorf("codec frame too short")
+		return nil, io.EOF
 	}
 	reader := bytes.NewReader(data)
 	var codecID byte
-	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
-		return nil, err
-	}
+	binary.Read(reader, binary.BigEndian, &codecID)
 	if codecID != 0x08 && codecID != 0x8E {
-		return nil, fmt.Errorf("unsupported codec ID %02X", codecID)
+		return nil, io.EOF
 	}
 
 	var recordCount byte
-	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
-		return nil, err
-	}
+	binary.Read(reader, binary.BigEndian, &recordCount)
 
 	records := make([]*AVLData, 0, int(recordCount))
 	for i := 0; i < int(recordCount); i++ {
-		avl, err := parseSingleAVL(reader)
-		if err != nil {
-			log.Printf("⚠️ Parse warning record %d: %v", i+1, err)
-			continue
-		}
+		avl, _ := parseSingleAVL(reader)
 		if avl != nil {
 			records = append(records, avl)
 		}
@@ -311,42 +253,34 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 }
 
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
-	startLen := r.Len()
-	if startLen < 15 { // minimal safe length
-		return nil, fmt.Errorf("AVL too short")
+	if r.Len() < 15 {
+		return nil, io.EOF
 	}
 
 	var timestamp uint64
-	if err := binary.Read(r, binary.BigEndian, &timestamp); err != nil {
-		return nil, err
-	}
-	nowMs := uint64(time.Now().UnixMilli())
-	if timestamp == 0 || timestamp > nowMs+24*3600*1000 || timestamp < 946684800000 {
-		timestamp = nowMs
+	binary.Read(r, binary.BigEndian, &timestamp)
+	if timestamp == 0 {
+		timestamp = uint64(time.Now().UnixMilli())
 	}
 
 	var priority byte
-	_ = binary.Read(r, binary.BigEndian, &priority)
+	binary.Read(r, binary.BigEndian, &priority)
 
 	var lonRaw, latRaw int32
-	_ = binary.Read(r, binary.BigEndian, &lonRaw)
-	_ = binary.Read(r, binary.BigEndian, &latRaw)
+	binary.Read(r, binary.BigEndian, &lonRaw)
+	binary.Read(r, binary.BigEndian, &latRaw)
 
 	var altitude, angle uint16
-	_ = binary.Read(r, binary.BigEndian, &altitude)
-	_ = binary.Read(r, binary.BigEndian, &angle)
+	binary.Read(r, binary.BigEndian, &altitude)
+	binary.Read(r, binary.BigEndian, &angle)
 
 	var satellites byte
-	_ = binary.Read(r, binary.BigEndian, &satellites)
+	binary.Read(r, binary.BigEndian, &satellites)
 
 	var speed uint16
-	_ = binary.Read(r, binary.BigEndian, &speed)
+	binary.Read(r, binary.BigEndian, &speed)
 
 	ioData, _ := parseIOElements(r)
-
-	if r.Len() > startLen { // sanity check
-		return nil, fmt.Errorf("AVL record exceeds expected length")
-	}
 
 	return &AVLData{
 		Timestamp:  time.UnixMilli(int64(timestamp)),
@@ -364,9 +298,7 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	ioData := make(map[uint8]interface{})
 	readCount := func() (uint16, error) {
 		var cnt uint16
-		if err := binary.Read(r, binary.BigEndian, &cnt); err != nil {
-			return 0, err
-		}
+		binary.Read(r, binary.BigEndian, &cnt)
 		return cnt, nil
 	}
 
@@ -374,23 +306,23 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		n, _ := readCount()
 		for i := 0; i < int(n); i++ {
 			var id byte
-			_ = binary.Read(r, binary.BigEndian, &id)
+			binary.Read(r, binary.BigEndian, &id)
 			switch size {
 			case 1:
 				var val byte
-				_ = binary.Read(r, binary.BigEndian, &val)
+				binary.Read(r, binary.BigEndian, &val)
 				ioData[id] = val
 			case 2:
 				var val uint16
-				_ = binary.Read(r, binary.BigEndian, &val)
+				binary.Read(r, binary.BigEndian, &val)
 				ioData[id] = val
 			case 4:
 				var val uint32
-				_ = binary.Read(r, binary.BigEndian, &val)
+				binary.Read(r, binary.BigEndian, &val)
 				ioData[id] = val
 			case 8:
 				var val uint64
-				_ = binary.Read(r, binary.BigEndian, &val)
+				binary.Read(r, binary.BigEndian, &val)
 				ioData[id] = val
 			}
 		}
@@ -441,15 +373,12 @@ func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 	for _, r := range recs {
 		ioJSON, _ := json.Marshal(r.IOData)
 		if positionsHasIoData {
-			_, err = stmt.Exec(deviceID, r.Latitude, r.Longitude, r.Speed,
+			stmt.Exec(deviceID, r.Latitude, r.Longitude, r.Speed,
 				r.Angle, r.Altitude, r.Satellites, r.Timestamp.UTC(),
 				imei, ioJSON)
 		} else {
-			_, err = stmt.Exec(deviceID, r.Latitude, r.Longitude, r.Speed,
+			stmt.Exec(deviceID, r.Latitude, r.Longitude, r.Speed,
 				r.Angle, r.Altitude, r.Satellites, r.Timestamp.UTC(), imei)
-		}
-		if err != nil {
-			return err
 		}
 	}
 
@@ -480,15 +409,10 @@ func postPositionsToBackend(records []*AVLData, deviceID int, imei string) error
 	data, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", backendTrackURL, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
+	resp, _ := httpClient.Do(req)
+	if resp != nil {
+		resp.Body.Close()
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	log.Printf("📬 Backend response (%d): %.200s", resp.StatusCode, string(body))
 	return nil
 }
 
@@ -496,7 +420,7 @@ func sendACK(conn net.Conn, count int) {
 	ack := make([]byte, 5)
 	binary.BigEndian.PutUint32(ack, uint32(count))
 	ack[4] = 0x01
-	_, _ = conn.Write(ack)
+	conn.Write(ack)
 }
 
 func getEnv(key, fallback string) string {
