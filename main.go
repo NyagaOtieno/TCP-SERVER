@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,7 +44,14 @@ var (
 	httpClient         = &http.Client{Timeout: 10 * time.Second}
 	wg                 sync.WaitGroup
 	positionsHasIoData bool
+	verbose            = true
 )
+
+func vLog(format string, a ...interface{}) {
+	if verbose {
+		log.Printf(format, a...)
+	}
+}
 
 func init() {
 	log.SetOutput(os.Stdout)
@@ -71,13 +79,13 @@ func init() {
 	if err = db.Ping(); err != nil {
 		log.Fatalf("❌ PostgreSQL ping failed: %v", err)
 	}
-	log.Println("✅ PostgreSQL connected successfully")
+	vLog("✅ PostgreSQL connected successfully")
 
 	positionsHasIoData = checkPositionsHasIoData()
 	if positionsHasIoData {
-		log.Println("ℹ️ positions.io_data column detected; will store IO JSON")
+		vLog("ℹ️ positions.io_data column detected; will store IO JSON")
 	} else {
-		log.Println("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
+		vLog("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
 	}
 }
 
@@ -91,7 +99,7 @@ func checkPositionsHasIoData() bool {
 }
 
 func main() {
-	log.Println("🚀 starting Teltonika server...")
+	vLog("🚀 Starting Teltonika TCP server...")
 
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
@@ -99,19 +107,19 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("✅ TCP Server listening on %s", tcpServerHost)
+	vLog("✅ TCP Server listening on %s", tcpServerHost)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("⚠️ Accept error:", err)
+			vLog("⚠️ Accept error: %v", err)
 			continue
 		}
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("🔥 panic recovered in connection goroutine: %v", r)
+					vLog("🔥 Panic recovered in connection goroutine: %v", r)
 				}
 			}()
 			handleConnection(c)
@@ -128,18 +136,18 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	remote := conn.RemoteAddr().String()
-	log.Printf("🔗 new connection from %s", remote)
+	vLog("🔗 New connection from %s", remote)
 
 	imei, err := readIMEI(conn)
 	if err != nil {
-		log.Printf("❌ Failed IMEI read from %s: %v", remote, err)
+		vLog("❌ Failed IMEI read from %s: %v", remote, err)
 		return
 	}
-	log.Printf("📡 Device connected: %s (from %s)", imei, remote)
+	vLog("📡 Device connected: %s (from %s)", imei, remote)
 
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
-		log.Printf("❌ Device lookup failed for IMEI %s: %v", imei, err)
+		vLog("❌ Device lookup failed for IMEI %s: %v", imei, err)
 		return
 	}
 
@@ -151,22 +159,24 @@ func handleConnection(conn net.Conn) {
 		n, err := conn.Read(tmp)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				log.Printf("⏱ read timeout for %s, closing connection", imei)
+				vLog("⏱ Read timeout for %s, closing connection", imei)
 			} else if err != io.EOF {
-				log.Printf("🔌 Read error for %s: %v", imei, err)
+				vLog("🔌 Read error for %s: %v", imei, err)
 			}
 			return
 		}
 
 		if n > 0 {
+			vLog("🟢 Raw TCP bytes (%d) from %s: %s", n, imei, hex.EncodeToString(tmp[:n]))
 			residual = append(residual, tmp[:n]...)
-			log.Printf("🟢 Raw TCP bytes (%d) from %s", n, imei)
+			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
 		for len(residual) >= 4 {
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
+			vLog("📦 Packet length from %s: %d", imei, packetLen)
 			if packetLen <= 0 || packetLen > 5*1024*1024 {
-				log.Printf("⚠️ invalid packet length %d from %s", packetLen, imei)
+				vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
 				residual = residual[4:]
 				continue
 			}
@@ -176,16 +186,19 @@ func handleConnection(conn net.Conn) {
 			}
 
 			frame := residual[4 : 4+packetLen]
+			vLog("🔹 Frame before normalization: %s", hex.EncodeToString(frame))
+
 			codecPayload, err := normalizeToCodec8(frame)
 			if err != nil {
-				log.Printf("❌ Frame normalization failed for %s: %v", imei, err)
+				vLog("❌ Frame normalization failed for %s: %v", imei, err)
 				residual = residual[4+packetLen:]
 				continue
 			}
+			vLog("🔹 Normalized Codec8 frame (%d bytes): %s", len(codecPayload), hex.EncodeToString(codecPayload))
 
 			records, err := parseCodec(codecPayload)
 			if err != nil {
-				log.Printf("❌ Frame parse error for %s: %v", imei, err)
+				vLog("❌ Frame parse error for %s: %v", imei, err)
 				residual = residual[4+packetLen:]
 				continue
 			}
@@ -197,9 +210,16 @@ func handleConnection(conn net.Conn) {
 				}
 			}
 
-			log.Printf("🔎 Parsed %d valid AVL record(s) for %s", len(validRecords), imei)
+			vLog("🔎 Parsed %d valid AVL record(s) for %s", len(validRecords), imei)
+			for _, avl := range validRecords {
+				vLog("📍 AVL Record: TS=%s LAT=%.7f LNG=%.7f SPD=%d ALT=%d ANG=%d SAT=%d IO=%v",
+					avl.Timestamp.UTC().Format(time.RFC3339),
+					avl.Latitude, avl.Longitude,
+					avl.Speed, avl.Altitude, avl.Angle, avl.Satellites, avl.IOData)
+			}
+
 			if err := storePositionsBatch(deviceID, imei, validRecords); err != nil {
-				log.Printf("❌ DB batch insert failed for %s: %v", imei, err)
+				vLog("❌ DB batch insert failed for %s: %v", imei, err)
 			}
 
 			payload := make([]map[string]interface{}, 0, len(validRecords))
@@ -219,11 +239,12 @@ func handleConnection(conn net.Conn) {
 			}
 
 			if err := postPositionsToBackend(payload); err != nil {
-				log.Printf("❌ Failed backend post for %s: %v", imei, err)
+				vLog("❌ Failed backend post for %s: %v", imei, err)
 			}
 
 			sendACK(conn, len(validRecords))
 			residual = residual[4+packetLen:]
+			vLog("📤 Residual buffer length after processing: %d", len(residual))
 		}
 	}
 }
@@ -265,7 +286,7 @@ func readIMEI(conn net.Conn) (string, error) {
 	imei := re.ReplaceAllString(string(raw), "")
 
 	_, _ = conn.Write([]byte{0x01})
-	log.Printf("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", string(raw), imei)
+	vLog("🔢 Raw IMEI read: %q, Cleaned IMEI: %s", string(raw), imei)
 	return imei, nil
 }
 
@@ -323,7 +344,7 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 	for i := 0; i < int(recordCount); i++ {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
-			log.Printf("⚠️ IO parse warning for record %d: %v", i, err)
+			vLog("⚠️ IO parse warning for record %d: %v", i, err)
 			continue
 		}
 		if avl != nil {
@@ -469,6 +490,8 @@ func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 
 	for _, r := range recs {
 		ioJSON, _ := json.Marshal(r.IOData)
+		vLog("💾 Inserting position into DB: DeviceID=%d IMEI=%s LAT=%.7f LNG=%.7f",
+			deviceID, imei, r.Latitude, r.Longitude)
 		if positionsHasIoData {
 			_, err = stmt.Exec(deviceID, r.Latitude, r.Longitude, r.Speed, r.Angle,
 				r.Altitude, r.Satellites, r.Timestamp.UTC(), imei, ioJSON)
@@ -499,7 +522,7 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	log.Printf("📬 Backend response (%d): %.200s", resp.StatusCode, string(body))
+	vLog("📬 Backend response (%d): %.200s", resp.StatusCode, string(body))
 	return nil
 }
 
@@ -508,11 +531,15 @@ func sendACK(conn net.Conn, count int) {
 	binary.BigEndian.PutUint32(ack, uint32(count))
 	ack[4] = 0x01
 	_, _ = conn.Write(ack)
+	vLog("✅ ACK sent to %s for %d record(s)", conn.RemoteAddr(), count)
 }
 
-func getEnv(key, fallback string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return v
+// ---------------- Utility ----------------
+
+func getEnv(key, def string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
 	}
-	return fallback
+	return val
 }
