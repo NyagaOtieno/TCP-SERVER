@@ -39,11 +39,11 @@ type Device struct {
 }
 
 var (
-	tcpServerHost     string
-	backendTrackURL   string
-	db                *sql.DB
-	httpClient        = &http.Client{Timeout: 10 * time.Second}
-	wg                sync.WaitGroup
+	tcpServerHost      string
+	backendTrackURL    string
+	db                 *sql.DB
+	httpClient         = &http.Client{Timeout: 10 * time.Second}
+	wg                 sync.WaitGroup
 	positionsHasIoData bool
 )
 
@@ -80,7 +80,7 @@ func init() {
 	if positionsHasIoData {
 		log.Println("ℹ️ positions.io_data column detected; will store IO JSON")
 	} else {
-		log.Println("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
+		log.Println("⚠️ positions.io_data column not detected; IO data will be omitted")
 	}
 }
 
@@ -144,7 +144,7 @@ func handleConnection(conn net.Conn) {
 	}
 
 	residual := make([]byte, 0)
-	tmp := make([]byte, 4096)
+	tmp := make([]byte, 8192)
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -162,12 +162,11 @@ func handleConnection(conn net.Conn) {
 			residual = append(residual, tmp[:n]...)
 		}
 
-		// TCP framing: 4-byte length prefix
 		for len(residual) >= 4 {
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
-			if packetLen <= 0 || packetLen > 5*1024*1024 {
-				log.Printf("⚠️ Invalid packet length %d", packetLen)
-				residual = residual[4:]
+			if packetLen <= 0 || packetLen > 10*1024*1024 {
+				log.Printf("⚠️ Invalid packet length %d, discarding first byte", packetLen)
+				residual = residual[1:]
 				continue
 			}
 
@@ -207,7 +206,6 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// normalizeToCodec8 returns slice starting at Codec8 ID
 func normalizeToCodec8(frame []byte) ([]byte, error) {
 	if len(frame) == 0 {
 		return nil, fmt.Errorf("empty frame")
@@ -291,19 +289,22 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 	}
 
 	var recordCount byte
-	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
-		return nil, err
+	if codecID == 0x08 {
+		_ = binary.Read(reader, binary.BigEndian, &recordCount)
 	}
 
-	records := make([]*AVLData, 0, int(recordCount))
-	for i := 0; i < int(recordCount); i++ {
+	records := make([]*AVLData, 0)
+	for reader.Len() > 0 {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
-			log.Printf("⚠️ Parse warning record %d: %v", i, err)
+			log.Printf("⚠️ Parse warning: %v", err)
 			continue
 		}
 		if avl != nil {
 			records = append(records, avl)
+		}
+		if codecID == 0x08 && len(records) >= int(recordCount) {
+			break
 		}
 	}
 
@@ -316,9 +317,7 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 	}
 
 	var timestamp uint64
-	if err := binary.Read(r, binary.BigEndian, &timestamp); err != nil {
-		return nil, err
-	}
+	_ = binary.Read(r, binary.BigEndian, &timestamp)
 	nowMs := uint64(time.Now().UnixMilli())
 	if timestamp == 0 || timestamp > nowMs+24*3600*1000 || timestamp < 946684800000 {
 		timestamp = nowMs
@@ -358,17 +357,14 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	ioData := make(map[uint8]interface{})
 
-	readCount := func() (uint16, error) {
+	readCount := func() uint16 {
 		var cnt uint16
-		if err := binary.Read(r, binary.BigEndian, &cnt); err != nil {
-			return 0, err
-		}
-		return cnt, nil
+		_ = binary.Read(r, binary.BigEndian, &cnt)
+		return cnt
 	}
 
 	// N1 - 1 byte values
-	n1, _ := readCount()
-	for i := 0; i < int(n1); i++ {
+	for i := 0; i < int(readCount()); i++ {
 		var id, val byte
 		_ = binary.Read(r, binary.BigEndian, &id)
 		_ = binary.Read(r, binary.BigEndian, &val)
@@ -376,8 +372,7 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	}
 
 	// N2 - 2 byte values
-	n2, _ := readCount()
-	for i := 0; i < int(n2); i++ {
+	for i := 0; i < int(readCount()); i++ {
 		var id byte
 		var val uint16
 		_ = binary.Read(r, binary.BigEndian, &id)
@@ -386,8 +381,7 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	}
 
 	// N4 - 4 byte values
-	n4, _ := readCount()
-	for i := 0; i < int(n4); i++ {
+	for i := 0; i < int(readCount()); i++ {
 		var id byte
 		var val uint32
 		_ = binary.Read(r, binary.BigEndian, &id)
@@ -396,13 +390,19 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	}
 
 	// N8 - 8 byte values
-	n8, _ := readCount()
-	for i := 0; i < int(n8); i++ {
+	for i := 0; i < int(readCount()); i++ {
 		var id byte
 		var val uint64
 		_ = binary.Read(r, binary.BigEndian, &id)
 		_ = binary.Read(r, binary.BigEndian, &val)
 		ioData[id] = val
+	}
+
+	// Remaining bytes as raw field
+	if r.Len() > 0 {
+		rest := make([]byte, r.Len())
+		_ = binary.Read(r, binary.BigEndian, &rest)
+		ioData[255] = rest
 	}
 
 	return ioData, nil
