@@ -20,16 +20,16 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// AVLData represents a single GPS/IO record
+// AVLData represents a GPS/IO record
 type AVLData struct {
-	Timestamp  time.Time
-	Latitude   float64
-	Longitude  float64
-	Altitude   int
-	Angle      int
-	Satellites int
-	Speed      int
-	IOData     map[uint8]interface{}
+	Timestamp  time.Time              `json:"timestamp"`
+	Latitude   float64                `json:"latitude"`
+	Longitude  float64                `json:"longitude"`
+	Altitude   int                    `json:"altitude"`
+	Angle      int                    `json:"angle"`
+	Satellites int                    `json:"satellites"`
+	Speed      int                    `json:"speed"`
+	IOData     map[uint8]interface{} `json:"io_data,omitempty"`
 }
 
 // Device represents a registered device
@@ -39,11 +39,11 @@ type Device struct {
 }
 
 var (
-	tcpServerHost      string
-	backendTrackURL    string
-	db                 *sql.DB
-	httpClient         = &http.Client{Timeout: 10 * time.Second}
-	wg                 sync.WaitGroup
+	tcpServerHost     string
+	backendTrackURL   string
+	db                *sql.DB
+	httpClient        = &http.Client{Timeout: 10 * time.Second}
+	wg                sync.WaitGroup
 	positionsHasIoData bool
 )
 
@@ -80,7 +80,7 @@ func init() {
 	if positionsHasIoData {
 		log.Println("ℹ️ positions.io_data column detected; will store IO JSON")
 	} else {
-		log.Println("⚠️ positions.io_data column not detected; IO data will be omitted")
+		log.Println("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
 	}
 }
 
@@ -144,7 +144,7 @@ func handleConnection(conn net.Conn) {
 	}
 
 	residual := make([]byte, 0)
-	tmp := make([]byte, 8192)
+	tmp := make([]byte, 4096)
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -162,30 +162,35 @@ func handleConnection(conn net.Conn) {
 			residual = append(residual, tmp[:n]...)
 		}
 
-		for len(residual) >= 4 {
+		// TCP framing: 4-byte length prefix
+		for {
+			if len(residual) < 4 {
+				break
+			}
+
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
 			if packetLen <= 0 || packetLen > 10*1024*1024 {
-				log.Printf("⚠️ Invalid packet length %d, discarding first byte", packetLen)
+				log.Printf("⚠️ Invalid packet length %d, skipping first byte", packetLen)
 				residual = residual[1:]
 				continue
 			}
 
 			if len(residual) < 4+packetLen {
-				break
+				break // wait for more data
 			}
 
 			frame := residual[4 : 4+packetLen]
+			residual = residual[4+packetLen:]
+
 			codecPayload, err := normalizeToCodec8(frame)
 			if err != nil {
 				log.Printf("❌ Codec normalization failed: %v", err)
-				residual = residual[4+packetLen:]
 				continue
 			}
 
 			records, err := parseCodec(codecPayload)
 			if err != nil {
 				log.Printf("❌ Codec parse failed: %v", err)
-				residual = residual[4+packetLen:]
 				continue
 			}
 
@@ -201,7 +206,6 @@ func handleConnection(conn net.Conn) {
 			}
 
 			sendACK(conn, len(validRecords))
-			residual = residual[4+packetLen:]
 		}
 	}
 }
@@ -239,7 +243,6 @@ func readIMEI(conn net.Conn) (string, error) {
 
 	re := regexp.MustCompile(`\D`)
 	imei := re.ReplaceAllString(string(raw), "")
-
 	_, _ = conn.Write([]byte{0x01})
 	log.Printf("🔢 Raw IMEI: %q, Cleaned IMEI: %s", string(raw), imei)
 	return imei, nil
@@ -279,7 +282,6 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 		return nil, fmt.Errorf("codec frame too short")
 	}
 	reader := bytes.NewReader(data)
-
 	var codecID byte
 	if err := binary.Read(reader, binary.BigEndian, &codecID); err != nil {
 		return nil, err
@@ -289,22 +291,19 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 	}
 
 	var recordCount byte
-	if codecID == 0x08 {
-		_ = binary.Read(reader, binary.BigEndian, &recordCount)
+	if err := binary.Read(reader, binary.BigEndian, &recordCount); err != nil {
+		return nil, err
 	}
 
-	records := make([]*AVLData, 0)
-	for reader.Len() > 0 {
+	records := make([]*AVLData, 0, int(recordCount))
+	for i := 0; i < int(recordCount); i++ {
 		avl, err := parseSingleAVL(reader)
 		if err != nil {
-			log.Printf("⚠️ Parse warning: %v", err)
+			log.Printf("⚠️ Parse warning record %d: %v", i+1, err)
 			continue
 		}
 		if avl != nil {
 			records = append(records, avl)
-		}
-		if codecID == 0x08 && len(records) >= int(recordCount) {
-			break
 		}
 	}
 
@@ -312,12 +311,15 @@ func parseCodec(data []byte) ([]*AVLData, error) {
 }
 
 func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
-	if r.Len() < 28 {
+	startLen := r.Len()
+	if startLen < 15 { // minimal safe length
 		return nil, fmt.Errorf("AVL too short")
 	}
 
 	var timestamp uint64
-	_ = binary.Read(r, binary.BigEndian, &timestamp)
+	if err := binary.Read(r, binary.BigEndian, &timestamp); err != nil {
+		return nil, err
+	}
 	nowMs := uint64(time.Now().UnixMilli())
 	if timestamp == 0 || timestamp > nowMs+24*3600*1000 || timestamp < 946684800000 {
 		timestamp = nowMs
@@ -342,6 +344,10 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 
 	ioData, _ := parseIOElements(r)
 
+	if r.Len() > startLen { // sanity check
+		return nil, fmt.Errorf("AVL record exceeds expected length")
+	}
+
 	return &AVLData{
 		Timestamp:  time.UnixMilli(int64(timestamp)),
 		Latitude:   float64(latRaw) / 1e7,
@@ -356,55 +362,39 @@ func parseSingleAVL(r *bytes.Reader) (*AVLData, error) {
 
 func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	ioData := make(map[uint8]interface{})
-
-	readCount := func() uint16 {
+	readCount := func() (uint16, error) {
 		var cnt uint16
-		_ = binary.Read(r, binary.BigEndian, &cnt)
-		return cnt
+		if err := binary.Read(r, binary.BigEndian, &cnt); err != nil {
+			return 0, err
+		}
+		return cnt, nil
 	}
 
-	// N1 - 1 byte values
-	for i := 0; i < int(readCount()); i++ {
-		var id, val byte
-		_ = binary.Read(r, binary.BigEndian, &id)
-		_ = binary.Read(r, binary.BigEndian, &val)
-		ioData[id] = val
+	for _, size := range []int{1, 2, 4, 8} {
+		n, _ := readCount()
+		for i := 0; i < int(n); i++ {
+			var id byte
+			_ = binary.Read(r, binary.BigEndian, &id)
+			switch size {
+			case 1:
+				var val byte
+				_ = binary.Read(r, binary.BigEndian, &val)
+				ioData[id] = val
+			case 2:
+				var val uint16
+				_ = binary.Read(r, binary.BigEndian, &val)
+				ioData[id] = val
+			case 4:
+				var val uint32
+				_ = binary.Read(r, binary.BigEndian, &val)
+				ioData[id] = val
+			case 8:
+				var val uint64
+				_ = binary.Read(r, binary.BigEndian, &val)
+				ioData[id] = val
+			}
+		}
 	}
-
-	// N2 - 2 byte values
-	for i := 0; i < int(readCount()); i++ {
-		var id byte
-		var val uint16
-		_ = binary.Read(r, binary.BigEndian, &id)
-		_ = binary.Read(r, binary.BigEndian, &val)
-		ioData[id] = val
-	}
-
-	// N4 - 4 byte values
-	for i := 0; i < int(readCount()); i++ {
-		var id byte
-		var val uint32
-		_ = binary.Read(r, binary.BigEndian, &id)
-		_ = binary.Read(r, binary.BigEndian, &val)
-		ioData[id] = val
-	}
-
-	// N8 - 8 byte values
-	for i := 0; i < int(readCount()); i++ {
-		var id byte
-		var val uint64
-		_ = binary.Read(r, binary.BigEndian, &id)
-		_ = binary.Read(r, binary.BigEndian, &val)
-		ioData[id] = val
-	}
-
-	// Remaining bytes as raw field
-	if r.Len() > 0 {
-		rest := make([]byte, r.Len())
-		_ = binary.Read(r, binary.BigEndian, &rest)
-		ioData[255] = rest
-	}
-
 	return ioData, nil
 }
 
