@@ -254,6 +254,10 @@ for _, r := range valid {
 _ = postPositionsToBackend(payload)
 sendACK(conn, len(valid))
 
+ residual = residual[4+packetLen:]
+        } 
+    } 
+} 
 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
