@@ -202,41 +202,58 @@ func handleConnection(conn net.Conn) {
 			}
 
 			valid := []*AVLData{}
-			for _, r := range records {
-				if r != nil && r.Latitude != 0 && r.Longitude != 0 {
-					valid = append(valid, r)
-				}
-			}
+for _, r := range records {
+    if r == nil {
+        continue
+    }
 
-			vLog("🔎 Parsed %d AVL records", len(valid))
+    // Skip zero coordinates
+    if r.Latitude == 0 || r.Longitude == 0 {
+        vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
+        continue
+    }
 
-			if err := storePositionsBatch(deviceID, imei, valid); err != nil {
-				vLog("❌ DB batch insert failed: %v", err)
-			}
+    // Skip records without satellites
+    if r.Satellites == 0 {
+        vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
+        continue
+    }
 
-			payload := []map[string]interface{}{}
-			for _, r := range valid {
-				payload = append(payload, map[string]interface{}{
-					"device_id":  deviceID,
-					"imei":       imei,
-					"timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
-					"latitude":   r.Latitude,
-					"longitude":  r.Longitude,
-					"speed":      r.Speed,
-					"angle":      r.Angle,
-					"altitude":   r.Altitude,
-					"satellites": r.Satellites,
-					"io_data":    r.IOData,
-				})
-			}
+    // Skip out-of-range coordinates
+    if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+        vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
+        continue
+    }
 
-			_ = postPositionsToBackend(payload)
-			sendACK(conn, len(valid))
-
-			residual = residual[4+packetLen:]
-		}
-	}
+    valid = append(valid, r)
 }
+
+vLog("🔎 Parsed %d valid AVL records", len(valid))
+
+if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+    vLog("❌ DB batch insert failed: %v", err)
+}
+
+// Post to backend
+payload := []map[string]interface{}{}
+for _, r := range valid {
+    payload = append(payload, map[string]interface{}{
+        "device_id":  deviceID,
+        "imei":       imei,
+        "timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
+        "latitude":   r.Latitude,
+        "longitude":  r.Longitude,
+        "speed":      r.Speed,
+        "angle":      r.Angle,
+        "altitude":   r.Altitude,
+        "satellites": r.Satellites,
+        "io_data":    r.IOData,
+    })
+}
+
+_ = postPositionsToBackend(payload)
+sendACK(conn, len(valid))
+
 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
