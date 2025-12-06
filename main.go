@@ -202,62 +202,51 @@ func handleConnection(conn net.Conn) {
 			}
 
 			valid := []*AVLData{}
-for _, r := range records {
-    if r == nil {
-        continue
-    }
+			for _, r := range records {
+				if r == nil {
+					continue
+				}
 
-    // Skip zero coordinates
-    if r.Latitude == 0 || r.Longitude == 0 {
-        vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
-        continue
-    }
+				if r.Latitude == 0 || r.Longitude == 0 {
+					continue
+				}
+				if r.Satellites == 0 {
+					continue
+				}
+				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+					continue
+				}
 
-    // Skip records without satellites
-    if r.Satellites == 0 {
-        vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
-        continue
-    }
+				valid = append(valid, r)
+			}
 
-    // Skip out-of-range coordinates
-    if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
-        vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
-        continue
-    }
+			if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+				vLog("❌ DB batch insert failed: %v", err)
+			}
 
-    valid = append(valid, r)
+			payload := []map[string]interface{}{}
+			for _, r := range valid {
+				payload = append(payload, map[string]interface{}{
+					"device_id":  deviceID,
+					"imei":       imei,
+					"timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
+					"latitude":   r.Latitude,
+					"longitude":  r.Longitude,
+					"speed":      r.Speed,
+					"angle":      r.Angle,
+					"altitude":   r.Altitude,
+					"satellites": r.Satellites,
+					"io_data":    r.IOData,
+				})
+			}
+
+			_ = postPositionsToBackend(payload)
+			sendACK(conn, len(valid))
+
+			residual = residual[4+packetLen:]
+		}
+	}
 }
-
-vLog("🔎 Parsed %d valid AVL records", len(valid))
-
-if err := storePositionsBatch(deviceID, imei, valid); err != nil {
-    vLog("❌ DB batch insert failed: %v", err)
-}
-
-// Post to backend
-payload := []map[string]interface{}{}
-for _, r := range valid {
-    payload = append(payload, map[string]interface{}{
-        "device_id":  deviceID,
-        "imei":       imei,
-        "timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
-        "latitude":   r.Latitude,
-        "longitude":  r.Longitude,
-        "speed":      r.Speed,
-        "angle":      r.Angle,
-        "altitude":   r.Altitude,
-        "satellites": r.Satellites,
-        "io_data":    r.IOData,
-    })
-}
-
-_ = postPositionsToBackend(payload)
-sendACK(conn, len(valid))
-
- residual = residual[4+packetLen:]
-        } 
-    } 
-} 
 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
@@ -280,7 +269,7 @@ func readIMEI(conn net.Conn) (string, error) {
 	re := regexp.MustCompile(`\D`)
 	imei := re.ReplaceAllString(string(raw), "")
 
-	_, _ = conn.Write([]byte{0x01}) // ACK
+	_, _ = conn.Write([]byte{0x01})
 	return imei, nil
 }
 
@@ -421,7 +410,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		return v
 	}
 
-	// 1-byte values
 	n1 := int(readByte())
 	for i := 0; i < n1; i++ {
 		id := readByte()
@@ -429,7 +417,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 2-byte values
 	n2 := int(readByte())
 	for i := 0; i < n2; i++ {
 		id := readByte()
@@ -437,7 +424,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 4-byte values
 	n4 := int(readByte())
 	for i := 0; i < n4; i++ {
 		id := readByte()
@@ -445,7 +431,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 8-byte values
 	n8 := int(readByte())
 	for i := 0; i < n8; i++ {
 		id := readByte()
@@ -522,6 +507,12 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 
 	req, _ := http.NewRequest("POST", backendTrackURL, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
+
+	//// ADDED: API KEY FIX (DO NOT REMOVE)
+	apiKey := os.Getenv("API_KEY")
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
