@@ -170,13 +170,11 @@ func handleConnection(conn net.Conn) {
 		}
 
 		if n > 0 {
-			// log raw bytes in hex
-			vLog("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
+			vLog("🟢 Raw TCP bytes: %x", tmp[:n])
 			residual = append(residual, tmp[:n]...)
-			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-		// process full packets
+		// Process all complete packets in the residual buffer
 		for len(residual) >= 4 {
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
 			if packetLen <= 0 || packetLen > 5*1024*1024 {
@@ -185,7 +183,7 @@ func handleConnection(conn net.Conn) {
 				continue
 			}
 
-			if len(residual) < 4+packetLen+4 { // wait for full packet + CRC
+			if len(residual) < 4+packetLen+4 { // Wait until full packet + CRC
 				break
 			}
 
@@ -193,6 +191,14 @@ func handleConnection(conn net.Conn) {
 			crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4])
 			if !checkCRC32(frame, crc) {
 				vLog("⚠️ CRC failed for %s", imei)
+				residual = residual[4+packetLen+4:]
+				continue
+			}
+
+			// Parse Codec 8 frame
+			frame, err := normalizeToCodec8(frame)
+			if err != nil {
+				vLog("❌ Failed to normalize frame: %v", err)
 				residual = residual[4+packetLen+4:]
 				continue
 			}
@@ -206,17 +212,16 @@ func handleConnection(conn net.Conn) {
 
 			valid := []*AVLData{}
 			for _, r := range records {
-				if r == nil || r.Latitude == 0 || r.Longitude == 0 || r.Satellites == 0 {
-					continue
+				if r != nil && r.Latitude != 0 && r.Longitude != 0 && r.Satellites != 0 {
+					if r.Latitude >= -90 && r.Latitude <= 90 && r.Longitude >= -180 && r.Longitude <= 180 {
+						valid = append(valid, r)
+					}
 				}
-				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
-					continue
-				}
-				valid = append(valid, r)
 			}
 
 			if len(valid) > 0 {
 				_ = storePositionsBatch(deviceID, imei, valid)
+
 				payload := make([]map[string]interface{}, 0, len(valid))
 				for _, r := range valid {
 					payload = append(payload, map[string]interface{}{
@@ -236,7 +241,7 @@ func handleConnection(conn net.Conn) {
 				sendACK(conn, len(valid))
 			}
 
-			residual = residual[4+packetLen+4:] // move past this packet + CRC
+			residual = residual[4+packetLen+4:] // Move past this packet + CRC
 		}
 	}
 }
