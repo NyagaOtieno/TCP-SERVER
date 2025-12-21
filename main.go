@@ -237,6 +237,7 @@ func handleConnection(conn net.Conn) {
 			residual = residual[4+packetLen+4:] // move past this packet + CRC
 		} // <-- close inner loop
 	} // <-- close outer loop
+	}
 
 
 // =====================================================
