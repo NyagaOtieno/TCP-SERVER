@@ -19,6 +19,7 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/joho/godotenv"
+	"hash/crc32"
 )
 
 type AVLData struct {
@@ -530,4 +531,11 @@ func getEnv(key, def string) string {
 		return def
 	}
 	return val
+}
+// =====================================================
+//                 CRC CHECK
+// =====================================================
+
+func checkCRC32(data []byte, expected uint32) bool {
+    return crc32.ChecksumIEEE(data) == expected
 }
