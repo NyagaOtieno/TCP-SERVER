@@ -175,69 +175,69 @@ func handleConnection(conn net.Conn) {
 			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-	for len(residual) >= 4 {
-    packetLen := int(binary.BigEndian.Uint32(residual[:4]))
-    if packetLen <= 0 || packetLen > 5*1024*1024 {
-        vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
-        residual = residual[1:] // skip 1 byte to resync
-        continue
-    }
+		for len(residual) >= 4 {
+			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
+			if packetLen <= 0 || packetLen > 5*1024*1024 {
+				vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
+				residual = residual[1:] // skip 1 byte to resync
+				continue
+			}
 
-    if len(residual) < 4+packetLen+4 { // wait for full packet + CRC
-        break
-    }
+			if len(residual) < 4+packetLen+4 { // wait for full packet + CRC
+				break
+			}
 
-    frame := residual[4 : 4+packetLen]
-    crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4])
-    if !checkCRC32(frame, crc) {
-        vLog("⚠️ CRC failed for %s", imei)
-        residual = residual[4+packetLen+4:]
-        continue
-    }
+			frame := residual[4 : 4+packetLen]
+			crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4])
+			if !checkCRC32(frame, crc) {
+				vLog("⚠️ CRC failed for %s", imei)
+				residual = residual[4+packetLen+4:]
+				continue
+			}
 
-    records, err := parseCodec(frame)
-    if err != nil {
-        vLog("❌ Frame parse error: %v", err)
-        residual = residual[4+packetLen+4:]
-        continue
-    }
+			records, err := parseCodec(frame)
+			if err != nil {
+				vLog("❌ Frame parse error: %v", err)
+				residual = residual[4+packetLen+4:]
+				continue
+			}
 
-    valid := []*AVLData{}
-    for _, r := range records {
-        if r == nil || r.Latitude == 0 || r.Longitude == 0 || r.Satellites == 0 {
-            continue
-        }
-        if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
-            continue
-        }
-        valid = append(valid, r)
-    }
+			valid := []*AVLData{}
+			for _, r := range records {
+				if r == nil || r.Latitude == 0 || r.Longitude == 0 || r.Satellites == 0 {
+					continue
+				}
+				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+					continue
+				}
+				valid = append(valid, r)
+			}
 
-    if len(valid) > 0 {
-        _ = storePositionsBatch(deviceID, imei, valid)
-        payload := make([]map[string]interface{}, 0, len(valid))
-        for _, r := range valid {
-            payload = append(payload, map[string]interface{}{
-                "device_id":  deviceID,
-                "imei":       imei,
-                "timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
-                "latitude":   r.Latitude,
-                "longitude":  r.Longitude,
-                "speed":      r.Speed,
-                "angle":      r.Angle,
-                "altitude":   r.Altitude,
-                "satellites": r.Satellites,
-                "io_data":    r.IOData,
-            })
-        }
-        _ = postPositionsToBackend(payload)
-        sendACK(conn, len(valid))
-    }
+			if len(valid) > 0 {
+				_ = storePositionsBatch(deviceID, imei, valid)
+				payload := make([]map[string]interface{}, 0, len(valid))
+				for _, r := range valid {
+					payload = append(payload, map[string]interface{}{
+						"device_id":  deviceID,
+						"imei":       imei,
+						"timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
+						"latitude":   r.Latitude,
+						"longitude":  r.Longitude,
+						"speed":      r.Speed,
+						"angle":      r.Angle,
+						"altitude":   r.Altitude,
+						"satellites": r.Satellites,
+						"io_data":    r.IOData,
+					})
+				}
+				_ = postPositionsToBackend(payload)
+				sendACK(conn, len(valid))
+			}
 
-    residual = residual[4+packetLen+4:] // move past this packet + CRC
-}
+			residual = residual[4+packetLen+4:] // move past this packet + CRC
+		} // <-- close inner loop
+	} // <-- close outer loop
 
-} 
 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
