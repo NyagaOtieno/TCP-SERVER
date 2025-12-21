@@ -172,18 +172,18 @@ func handleConnection(conn net.Conn) {
 		if n > 0 {
 			vLog("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 			residual = append(residual, tmp[:n]...)
+			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-		// Process all complete packets in the residual buffer
 		for len(residual) >= 4 {
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
 			if packetLen <= 0 || packetLen > 5*1024*1024 {
 				vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
-				residual = residual[1:] // skip 1 byte to resync
+				residual = residual[1:] // resync
 				continue
 			}
 
-			if len(residual) < 4+packetLen+4 { // Wait until full packet + CRC
+			if len(residual) < 4+packetLen+4 { // full packet + CRC not yet received
 				break
 			}
 
@@ -195,32 +195,35 @@ func handleConnection(conn net.Conn) {
 				continue
 			}
 
-			// Parse Codec 8 frame
-			frame, err := normalizeToCodec8(frame)
+			normalizedFrame, err := normalizeToCodec8(frame)
 			if err != nil {
-				vLog("❌ Failed to normalize frame: %v", err)
+				vLog("❌ Normalize frame error for %s: %v", imei, err)
 				residual = residual[4+packetLen+4:]
 				continue
 			}
 
-			records, err := parseCodec(frame)
+			records, err := parseCodec(normalizedFrame)
 			if err != nil {
-				vLog("❌ Frame parse error: %v", err)
+				vLog("❌ Frame parse error for %s: %v", imei, err)
 				residual = residual[4+packetLen+4:]
 				continue
 			}
 
 			valid := []*AVLData{}
 			for _, r := range records {
-				if r != nil && r.Latitude != 0 && r.Longitude != 0 && r.Satellites != 0 {
-					if r.Latitude >= -90 && r.Latitude <= 90 && r.Longitude >= -180 && r.Longitude <= 180 {
-						valid = append(valid, r)
-					}
+				if r == nil || r.Latitude == 0 || r.Longitude == 0 || r.Satellites == 0 {
+					continue
 				}
+				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+					continue
+				}
+				valid = append(valid, r)
 			}
 
 			if len(valid) > 0 {
-				_ = storePositionsBatch(deviceID, imei, valid)
+				if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+					vLog("❌ DB insert failed for %s: %v", imei, err)
+				}
 
 				payload := make([]map[string]interface{}, 0, len(valid))
 				for _, r := range valid {
@@ -237,16 +240,18 @@ func handleConnection(conn net.Conn) {
 						"io_data":    r.IOData,
 					})
 				}
-				_ = postPositionsToBackend(payload)
+				if err := postPositionsToBackend(payload); err != nil {
+					vLog("❌ Backend post failed for %s: %v", imei, err)
+				}
+
 				sendACK(conn, len(valid))
 			}
 
-			residual = residual[4+packetLen+4:] // Move past this packet + CRC
+			// Move past this packet + CRC
+			residual = residual[4+packetLen+4:]
 		}
 	}
 }
-
-
 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
