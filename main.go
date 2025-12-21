@@ -170,7 +170,7 @@ func handleConnection(conn net.Conn) {
 		}
 
 		if n > 0 {
-			vLog("🟢 Raw TCP bytes: %x", tmp[:n])
+			vLog("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 			residual = append(residual, tmp[:n]...)
 		}
 
