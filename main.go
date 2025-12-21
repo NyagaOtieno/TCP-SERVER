@@ -16,7 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+      "hash/crc32"
 	_ "github.com/lib/pq"
 	"github.com/joho/godotenv"
 )
@@ -171,55 +171,93 @@ func handleConnection(conn net.Conn) {
 		if n > 0 {
 			vLog("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 			residual = append(residual, tmp[:n]...)
+			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
 		for len(residual) >= 4 {
-			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
-			if packetLen <= 0 || packetLen > 5*1024*1024 {
-				residual = residual[1:]
-				continue
-			}
+    packetLen := int(binary.BigEndian.Uint32(residual[:4]))
+    if packetLen <= 0 || packetLen > 5*1024*1024 {
+        vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
+        residual = residual[1:] // advance just 1 byte, not 4
+        continue
+    }
 
-			if len(residual) < 4+packetLen+4 {
-				break
-			}
+    // Wait for full packet + CRC
+    if len(residual) < 4+packetLen+4 {
+        break
+    }
 
-			frame := residual[4 : 4+packetLen]
-			crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4])
+    frame := residual[4 : 4+packetLen]      // Codec Payload
+    crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4]) // CRC
+    if !checkCRC32(frame, crc) {
+        vLog("⚠️ CRC failed for %s", imei)
+        residual = residual[4+packetLen+4:]
+        continue
+    }
 
-			if !checkCRC32(frame, crc) {
-				vLog("⚠️ CRC failed for %s", imei)
-				residual = residual[4+packetLen+4:]
-				continue
-			}
+    records, err := parseCodec(frame)
+    ...
+    residual = residual[4+packetLen+4:] // move past payload + CRC
+}
 
-			records, err := parseCodec(frame)
-			if err != nil {
-				vLog("❌ Failed to parse Codec frame from %s: %v", imei, err)
-				residual = residual[4+packetLen+4:]
-				continue
-			}
 
 			valid := []*AVLData{}
-			for _, r := range records {
-				if r == nil || r.Latitude == 0 || r.Longitude == 0 || r.Satellites == 0 {
-					continue
-				}
-				valid = append(valid, r)
-			}
+for _, r := range records {
+    if r == nil {
+        continue
+    }
 
-			if len(valid) > 0 {
-				_ = storePositionsBatch(deviceID, imei, valid)
-				_ = postPositionsToBackend(validToPayload(valid, deviceID, imei))
-			}
+    // Skip zero coordinates
+    if r.Latitude == 0 || r.Longitude == 0 {
+        vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
+        continue
+    }
 
-			sendACK(conn, len(valid))
-			residual = residual[4+packetLen+4:]
-		}
-	}
+    // Skip records without satellites
+    if r.Satellites == 0 {
+        vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
+        continue
+    }
+
+    // Skip out-of-range coordinates
+    if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+        vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
+        continue
+    }
+
+    valid = append(valid, r)
 }
- 
- 
+
+vLog("🔎 Parsed %d valid AVL records", len(valid))
+
+if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+    vLog("❌ DB batch insert failed: %v", err)
+}
+
+// Post to backend
+payload := []map[string]interface{}{}
+for _, r := range valid {
+    payload = append(payload, map[string]interface{}{
+        "device_id":  deviceID,
+        "imei":       imei,
+        "timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
+        "latitude":   r.Latitude,
+        "longitude":  r.Longitude,
+        "speed":      r.Speed,
+        "angle":      r.Angle,
+        "altitude":   r.Altitude,
+        "satellites": r.Satellites,
+        "io_data":    r.IOData,
+    })
+}
+
+_ = postPositionsToBackend(payload)
+sendACK(conn, len(valid))
+
+ residual = residual[4+packetLen:]
+        } 
+    } 
+} 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
 // =====================================================
@@ -512,4 +550,10 @@ func getEnv(key, def string) string {
 		return def
 	}
 	return val
+}
+
+// checkCRC32 validates a Teltonika packet
+func checkCRC32(frame []byte, crc uint32) bool {
+	calculated := crc32.ChecksumIEEE(frame)
+	return calculated == crc
 }
