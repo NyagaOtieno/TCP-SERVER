@@ -175,31 +175,31 @@ func handleConnection(conn net.Conn) {
 		}
 
 		for len(residual) >= 4 {
-			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
-			if packetLen <= 0 || packetLen > 5*1024*1024 {
-				vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
-				residual = residual[4:]
-				continue
-			}
+    packetLen := int(binary.BigEndian.Uint32(residual[:4]))
+    if packetLen <= 0 || packetLen > 5*1024*1024 {
+        vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
+        residual = residual[1:] // advance just 1 byte, not 4
+        continue
+    }
 
-			if len(residual) < 4+packetLen {
-				break
-			}
+    // Wait for full packet + CRC
+    if len(residual) < 4+packetLen+4 {
+        break
+    }
 
-			frame := residual[4 : 4+packetLen]
-			codecPayload, err := normalizeToCodec8(frame)
-			if err != nil {
-				vLog("❌ Codec normalization failed: %v", err)
-				residual = residual[4+packetLen:]
-				continue
-			}
+    frame := residual[4 : 4+packetLen]      // Codec Payload
+    crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4]) // CRC
+    if !checkCRC32(frame, crc) {
+        vLog("⚠️ CRC failed for %s", imei)
+        residual = residual[4+packetLen+4:]
+        continue
+    }
 
-			records, err := parseCodec(codecPayload)
-			if err != nil {
-				vLog("❌ Frame parse error: %v", err)
-				residual = residual[4+packetLen:]
-				continue
-			}
+    records, err := parseCodec(frame)
+    ...
+    residual = residual[4+packetLen+4:] // move past payload + CRC
+}
+
 
 			valid := []*AVLData{}
 for _, r := range records {
