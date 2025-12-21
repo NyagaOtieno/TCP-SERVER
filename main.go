@@ -141,7 +141,6 @@ func handleConnection(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	vLog("🔗 New connection from %s", remote)
 
-	// Read IMEI
 	imei, err := readIMEI(conn)
 	if err != nil {
 		vLog("❌ Failed IMEI read from %s: %v", remote, err)
@@ -149,15 +148,13 @@ func handleConnection(conn net.Conn) {
 	}
 	vLog("📡 Device connected: %s", imei)
 
-	// Ensure device exists
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
 		vLog("❌ Device lookup failed for IMEI %s: %v", imei, err)
 		return
 	}
 
-	// Buffer to hold incoming bytes
-	var residual []byte
+	residual := make([]byte, 0)
 	tmp := make([]byte, 4096)
 
 	for {
@@ -173,29 +170,37 @@ func handleConnection(conn net.Conn) {
 		}
 
 		if n > 0 {
+			// log raw bytes in hex
+			vLog("🟢 Raw TCP bytes: %s", hex.EncodeToString(tmp[:n]))
 			residual = append(residual, tmp[:n]...)
-			vLog("🟢 Received %d bytes, residual length: %d", n, len(residual))
+			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-		// Process all complete packets in residual
+		// process full packets
 		for len(residual) >= 4 {
 			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
 			if packetLen <= 0 || packetLen > 5*1024*1024 {
 				vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
-				break // wait for more data
+				residual = residual[1:] // skip 1 byte to resync
+				continue
 			}
 
-			if len(residual) < 4+packetLen {
-				break // full packet not yet received
+			if len(residual) < 4+packetLen+4 { // wait for full packet + CRC
+				break
 			}
 
 			frame := residual[4 : 4+packetLen]
+			crc := binary.BigEndian.Uint32(residual[4+packetLen : 4+packetLen+4])
+			if !checkCRC32(frame, crc) {
+				vLog("⚠️ CRC failed for %s", imei)
+				residual = residual[4+packetLen+4:]
+				continue
+			}
 
-			// Parse Codec 8
 			records, err := parseCodec(frame)
 			if err != nil {
-				vLog("❌ Failed to parse frame from %s: %v", imei, err)
-				residual = residual[4+packetLen:] // skip invalid frame
+				vLog("❌ Frame parse error: %v", err)
+				residual = residual[4+packetLen+4:]
 				continue
 			}
 
@@ -212,7 +217,6 @@ func handleConnection(conn net.Conn) {
 
 			if len(valid) > 0 {
 				_ = storePositionsBatch(deviceID, imei, valid)
-
 				payload := make([]map[string]interface{}, 0, len(valid))
 				for _, r := range valid {
 					payload = append(payload, map[string]interface{}{
@@ -229,16 +233,14 @@ func handleConnection(conn net.Conn) {
 					})
 				}
 				_ = postPositionsToBackend(payload)
-
-				// Send ACK
 				sendACK(conn, len(valid))
 			}
 
-			// Move residual past the current packet
-			residual = residual[4+packetLen:]
+			residual = residual[4+packetLen+4:] // move past this packet + CRC
 		}
 	}
 }
+
 
 
 // =====================================================
