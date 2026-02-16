@@ -2,11 +2,11 @@ package main
 
 import (
 	"encoding/hex"
-	"fmt"
 	"io"
 	"log"
 	"net"
 )
+
 
 func handle(conn net.Conn) {
 	defer conn.Close()
