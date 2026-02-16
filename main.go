@@ -43,7 +43,7 @@ var (
 	tcpServerHost      string
 	backendTrackURL    string
 	db                 *sql.DB
-	httpClient         = &http.Client{Timeout: 10 * time.Second}
+	httpClient         = &http.Client{Timeout: 12 * time.Second}
 	wg                 sync.WaitGroup
 	positionsHasIoData bool
 	verbose            = true
@@ -117,6 +117,7 @@ func main() {
 			vLog("⚠️ Accept error: %v", err)
 			continue
 		}
+
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer func() {
@@ -127,12 +128,10 @@ func main() {
 			handleConnection(c)
 		}(conn)
 	}
-
-	wg.Wait()
 }
 
 // =====================================================
-//                 CONNECTION HANDLING
+//              PROTOCOL DETECTION + ROUTING
 // =====================================================
 
 type ProtocolKind int
@@ -144,18 +143,14 @@ const (
 )
 
 func detectProtocolPeek(br *bufio.Reader) ProtocolKind {
-	peek, _ := br.Peek(8)
+	peek, _ := br.Peek(16)
 	if len(peek) >= 2 && peek[0] == 0x78 && peek[1] == 0x78 {
 		return ProtoGT06
 	}
-	// UniGuard is ASCII starting with S168 (or Sxxx) and ends with $
-	if len(peek) >= 1 && (peek[0] == 'S' || peek[0] == 's') {
-		// likely UniGuard if we see a '#'
-		if bytes.Contains(peek, []byte("#")) {
-			return ProtoUniGuard
-		}
+	// UniGuard packets are ASCII starting with Sxxx#... ending with $
+	if len(peek) >= 1 && (peek[0] == 'S' || peek[0] == 's') && bytes.Contains(peek, []byte("#")) {
+		return ProtoUniGuard
 	}
-	// Default: Teltonika IMEI handshake (0x000F prefix or ASCII digits)
 	return ProtoTeltonika
 }
 
@@ -166,10 +161,13 @@ func handleConnection(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	vLog("🔗 New connection from %s", remote)
 
-	br := bufio.NewReaderSize(conn, 64*1024)
+	br := bufio.NewReaderSize(conn, 128*1024)
 
-	kind := detectProtocolPeek(br)
-	switch kind {
+	if p, _ := br.Peek(32); len(p) > 0 {
+		vLog("👀 First bytes: %s", hex.EncodeToString(p))
+	}
+
+	switch detectProtocolPeek(br) {
 	case ProtoGT06:
 		handleGT06(br, conn)
 	case ProtoUniGuard:
@@ -180,7 +178,7 @@ func handleConnection(conn net.Conn) {
 }
 
 // =====================================================
-//                 TELTONIKA (YOUR EXISTING FLOW)
+//                    TELTONIKA (FMB/FMC)
 // =====================================================
 
 func handleTeltonika(br *bufio.Reader, conn net.Conn) {
@@ -199,11 +197,11 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 		return
 	}
 
-	residual := make([]byte, 0)
+	residual := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		n, err := br.Read(tmp)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -220,57 +218,79 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-		for len(residual) >= 4 {
-			packetLen := int(binary.BigEndian.Uint32(residual[:4]))
-			if packetLen <= 0 || packetLen > 5*1024*1024 {
-				vLog("⚠️ Invalid packet length %d from %s", packetLen, imei)
-				residual = residual[4:]
-				continue
-			}
-
-			if len(residual) < 4+packetLen {
+		// Teltonika frame format:
+		// 4 bytes preamble (00000000)
+		// 4 bytes data length (N)
+		// N bytes data (Codec8/8E payload)
+		// 4 bytes CRC
+		for {
+			if len(residual) < 8 {
 				break
 			}
 
-			frame := residual[4 : 4+packetLen]
-			codecPayload, err := normalizeToCodec8(frame)
+			// resync to preamble
+			if binary.BigEndian.Uint32(residual[:4]) != 0 {
+				idx := bytes.Index(residual, []byte{0x00, 0x00, 0x00, 0x00})
+				if idx == -1 {
+					if len(residual) > 3 {
+						residual = residual[len(residual)-3:]
+					}
+					break
+				}
+				residual = residual[idx:]
+				if len(residual) < 8 {
+					break
+				}
+			}
+
+			dataLen := int(binary.BigEndian.Uint32(residual[4:8]))
+			if dataLen <= 0 || dataLen > 5*1024*1024 {
+				vLog("⚠️ Invalid dataLen %d from %s, resync...", dataLen, imei)
+				residual = residual[1:]
+				continue
+			}
+
+			total := 8 + dataLen + 4
+			if len(residual) < total {
+				break
+			}
+
+			data := residual[8 : 8+dataLen]
+			// crc := residual[8+dataLen : total] // available if you want validate CRC
+			_ = residual[8+dataLen : total]
+
+			codecPayload, err := normalizeToCodec8(data)
 			if err != nil {
 				vLog("❌ Codec normalization failed: %v", err)
-				residual = residual[4+packetLen:]
+				residual = residual[total:]
 				continue
 			}
 
 			records, err := parseCodec(codecPayload)
 			if err != nil {
 				vLog("❌ Frame parse error: %v", err)
-				residual = residual[4+packetLen:]
+				residual = residual[total:]
 				continue
 			}
 
-			valid := []*AVLData{}
+			valid := make([]*AVLData, 0, len(records))
 			for _, r := range records {
 				if r == nil {
 					continue
 				}
 
-				// Skip zero coordinates
 				if r.Latitude == 0 || r.Longitude == 0 {
 					vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
 					continue
 				}
-
-				// Skip records without satellites
 				if r.Satellites == 0 {
 					vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
 					continue
 				}
-
-				// Skip out-of-range coordinates
 				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
 					vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
 					continue
 				}
-
 				valid = append(valid, r)
 			}
 
@@ -280,7 +300,6 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 				vLog("❌ DB batch insert failed: %v", err)
 			}
 
-			// Post to backend
 			payload := []map[string]interface{}{}
 			for _, r := range valid {
 				payload = append(payload, map[string]interface{}{
@@ -296,35 +315,39 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 					"io_data":    r.IOData,
 				})
 			}
-
 			_ = postPositionsToBackend(payload)
-			sendACK(conn, len(valid))
 
-			residual = residual[4+packetLen:]
+			// ✅ Correct Teltonika ACK: 4-byte accepted records count
+			sendTeltonikaACK(conn, len(valid))
+
+			residual = residual[total:]
 		}
 	}
 }
 
+func sendTeltonikaACK(conn net.Conn, count int) {
+	ack := make([]byte, 4)
+	binary.BigEndian.PutUint32(ack, uint32(count))
+	_, _ = conn.Write(ack)
+}
+
 // =====================================================
-//                 GT06 HANDLER (0x78 0x78 ... 0x0D0A)
+//                    GT06
 // =====================================================
 
 func handleGT06(br *bufio.Reader, conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	vLog("📡 GT06 connection from %s", remote)
 
-	// First packet should be login (protocol 0x01) containing Terminal ID (IMEI in BCD-like bytes).
 	imei, serial, err := readGT06Login(br)
 	if err != nil {
-		vLog("❌ GT06 login read failed: %v", err)
+		vLog("❌ GT06 login failed: %v", err)
 		return
 	}
-	vLog("✅ GT06 device login IMEI=%s serial=0x%04X", imei, serial)
+	vLog("✅ GT06 login IMEI=%s serial=0x%04X", imei, serial)
 
-	// respond login ACK
-	if err := writeGT06Ack(conn, 0x01, serial); err != nil {
-		vLog("⚠️ GT06 login ACK write failed: %v", err)
-	}
+	// ACK login
+	_ = writeGT06Ack(conn, 0x01, serial)
 
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
@@ -333,7 +356,7 @@ func handleGT06(br *bufio.Reader, conn net.Conn) {
 	}
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		conn.SetReadDeadline(time.Now().Add(20 * time.Minute))
 		pkt, proto, serial, err := readGT06Packet(br)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -347,57 +370,41 @@ func handleGT06(br *bufio.Reader, conn net.Conn) {
 		}
 
 		switch proto {
-		case 0x12: // location
+		case 0x12, 0x16: // location / alarm location
 			rec, ok := parseGT06Location(pkt)
 			if ok {
 				processOnePosition(deviceID, imei, rec)
 			}
 			_ = writeGT06Ack(conn, proto, serial)
 
-		case 0x16: // alarm packet (contains GPS fields same order, plus extra)
-			rec, ok := parseGT06Location(pkt)
-			if ok {
-				processOnePosition(deviceID, imei, rec)
-			}
-			_ = writeGT06Ack(conn, proto, serial)
-
-		case 0x13: // heartbeat/status
-			// ACK heartbeat to keep link stable
-			_ = writeGT06Ack(conn, proto, serial)
-
-		case 0x15, 0x1A:
-			// string / query packets - ACK to be safe
+		case 0x13: // heartbeat
 			_ = writeGT06Ack(conn, proto, serial)
 
 		default:
-			// Unknown protocol - still ACK with same proto
 			vLog("ℹ️ GT06 proto 0x%02X len=%d", proto, len(pkt))
 			_ = writeGT06Ack(conn, proto, serial)
 		}
 	}
 }
 
-// readGT06Login reads the first GT06 login packet and returns IMEI + serial.
 func readGT06Login(br *bufio.Reader) (string, uint16, error) {
 	pkt, proto, serial, err := readGT06Packet(br)
 	if err != nil {
 		return "", 0, err
 	}
 	if proto != 0x01 {
-		return "", 0, fmt.Errorf("expected GT06 login proto 0x01, got 0x%02X", proto)
+		return "", 0, fmt.Errorf("expected login proto 0x01, got 0x%02X", proto)
 	}
-	// payload: start(2) + len(1) + proto(1) + terminalID(8) + serial(2) + crc(2) + stop(2)
-	// readGT06Packet returns the full raw packet bytes.
+	// login has 8-byte terminal id after proto
 	if len(pkt) < 2+1+1+8+2+2+2 {
 		return "", 0, fmt.Errorf("login packet too short: %d", len(pkt))
 	}
-	terminalID := pkt[2+1+1 : 2+1+1+8] // 8 bytes
+	terminalID := pkt[2+1+1 : 2+1+1+8]
 	imei := gt06TerminalIDToIMEI(terminalID)
 	return imei, serial, nil
 }
 
 func readGT06Packet(br *bufio.Reader) ([]byte, byte, uint16, error) {
-	// Scan until start 0x78 0x78
 	for {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -414,14 +421,12 @@ func readGT06Packet(br *bufio.Reader) ([]byte, byte, uint16, error) {
 			continue
 		}
 
-		// length byte
 		lenByte, err := br.ReadByte()
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		l := int(lenByte) // bytes from protocol to CRC inclusive (proto+content+serial+crc)
+		l := int(lenByte)
 		if l < 5 || l > 255 {
-			// invalid, continue scanning
 			continue
 		}
 
@@ -430,13 +435,11 @@ func readGT06Packet(br *bufio.Reader) ([]byte, byte, uint16, error) {
 			return nil, 0, 0, err
 		}
 
-		// stop bytes
 		stop := make([]byte, 2)
 		if _, err := io.ReadFull(br, stop); err != nil {
 			return nil, 0, 0, err
 		}
 		if stop[0] != 0x0D || stop[1] != 0x0A {
-			// If framing is wrong, keep scanning.
 			continue
 		}
 
@@ -444,22 +447,18 @@ func readGT06Packet(br *bufio.Reader) ([]byte, byte, uint16, error) {
 		raw = append(raw, stop...)
 
 		proto := body[0]
-		serial := binary.BigEndian.Uint16(body[l-4 : l-2]) // serial is before crc
+		serial := binary.BigEndian.Uint16(body[l-4 : l-2]) // serial before crc
 		return raw, proto, serial, nil
 	}
 }
 
 func writeGT06Ack(w io.Writer, proto byte, serial uint16) error {
-	// Response packet format: 0x78 0x78 0x05 <proto> <serial(2)> <crc(2)> 0x0D 0x0A
-	// (same protocol number as request) :contentReference[oaicite:7]{index=7}
+	// 78 78 05 <proto> <serial> <crc> 0D 0A
 	pkt := make([]byte, 0, 10)
-	pkt = append(pkt, 0x78, 0x78)
-	pkt = append(pkt, 0x05)      // length
-	pkt = append(pkt, proto)     // protocol
-	pkt = append(pkt, 0x00, 0x00) // serial placeholder
+	pkt = append(pkt, 0x78, 0x78, 0x05, proto)
+	pkt = append(pkt, 0x00, 0x00)
 	binary.BigEndian.PutUint16(pkt[4:6], serial)
 
-	// CRC is calculated from length to serial (inclusive): [len][proto][serialHi][serialLo]
 	crcInput := []byte{0x05, proto, byte(serial >> 8), byte(serial & 0xFF)}
 	crc := crcITU(crcInput)
 	pkt = append(pkt, byte(crc>>8), byte(crc&0xFF))
@@ -470,30 +469,31 @@ func writeGT06Ack(w io.Writer, proto byte, serial uint16) error {
 }
 
 func parseGT06Location(raw []byte) (*AVLData, bool) {
-	// raw: start2 + len1 + body(len) + stop2
-	if len(raw) < 2+1+5+2 {
+	// raw: 78 78 <len> <body(len bytes)> 0D 0A
+	if len(raw) < 5 {
 		return nil, false
 	}
 	length := int(raw[2])
-	body := raw[3 : 3+length] // proto..crc
-	if len(body) < 1+6+1+4+4+1+2+2+2 {
-		// proto + datetime + gpslen/sat + lat + lon + speed + course/status + serial + crc
+	if len(raw) < 3+length+2 {
 		return nil, false
 	}
+	body := raw[3 : 3+length] // proto..crc
+
+	if len(body) < 1+6+1+4+4+1+2+2+2 {
+		return nil, false
+	}
+
 	proto := body[0]
 	if proto != 0x12 && proto != 0x16 {
 		return nil, false
 	}
 
-	// Offsets per spec for location packet :contentReference[oaicite:8]{index=8}
 	i := 1
 	dt := body[i : i+6]
 	i += 6
 
 	gpsLenSat := body[i]
 	i++
-
-	// satellites in low nibble (per doc: first nibble is GPS info length, second nibble is sat count) :contentReference[oaicite:9]{index=9}
 	sats := int(gpsLenSat & 0x0F)
 
 	latRaw := binary.BigEndian.Uint32(body[i : i+4])
@@ -504,19 +504,14 @@ func parseGT06Location(raw []byte) (*AVLData, bool) {
 	speed := int(body[i])
 	i++
 
-	cs := binary.BigEndian.Uint16(body[i : i+2])
-	i += 2
-
-	// Course is lower 10 bits
+	cs := binary.BigEndian.Uint16(body[i : i+2]) // course/status
 	angle := int(cs & 0x03FF)
 
-	// Status bits for sign: bit3 lon east/west, bit2 lat south/north :contentReference[oaicite:10]{index=10}
-	// (BYTE_1 is high byte of cs)
 	status := byte(cs >> 8)
 	lonWest := (status & (1 << 3)) != 0
 	latNorth := (status & (1 << 2)) != 0
 
-	// Conversion: (deg*60+minutes)*30000 => raw, so degrees = raw/30000/60 :contentReference[oaicite:11]{index=11}
+	// Convert: raw = (deg*60 + minutes) * 30000
 	lat := float64(latRaw) / 30000.0 / 60.0
 	lon := float64(lonRaw) / 30000.0 / 60.0
 
@@ -540,32 +535,30 @@ func parseGT06Location(raw []byte) (*AVLData, bool) {
 		Angle:      angle,
 		Satellites: sats,
 		Speed:      speed,
-		IOData:     map[uint8]interface{}{}, // GT06 doesn't map to Teltonika IO; keep empty
+		IOData:     map[uint8]interface{}{},
 	}, true
 }
 
 func parseGT06DateTime(b []byte) (time.Time, bool) {
-	// 6 bytes: YY MM DD HH MM SS (hex bytes)
 	if len(b) != 6 {
 		return time.Time{}, false
 	}
 	yy := int(b[0])
-	mm := time.Month(int(b[1]))
-	dd := int(b[2])
-	hh := int(b[3])
-	mi := int(b[4])
-	ss := int(b[5])
-
 	year := 2000 + yy
-	if mm < 1 || mm > 12 || dd < 1 || dd > 31 || hh > 23 || mi > 59 || ss > 59 {
+	month := time.Month(int(b[1]))
+	day := int(b[2])
+	h := int(b[3])
+	m := int(b[4])
+	s := int(b[5])
+
+	if month < 1 || month > 12 || day < 1 || day > 31 || h > 23 || m > 59 || s > 59 {
 		return time.Time{}, false
 	}
-	return time.Date(year, mm, dd, hh, mi, ss, 0, time.UTC), true
+	return time.Date(year, month, day, h, m, s, 0, time.UTC), true
 }
 
-// Terminal ID in login is IMEI 15 digits encoded as 8 bytes like 0x01 0x23 ... :contentReference[oaicite:12]{index=12}
 func gt06TerminalIDToIMEI(b []byte) string {
-	// Convert each nibble to decimal digit.
+	// terminal id is 8 bytes (BCD-like). Often yields 16 digits with leading 0.
 	var sb strings.Builder
 	for _, x := range b {
 		hi := (x >> 4) & 0x0F
@@ -574,18 +567,12 @@ func gt06TerminalIDToIMEI(b []byte) string {
 		sb.WriteByte('0' + lo)
 	}
 	s := sb.String()
-	// often includes a leading 0 to make 16 digits, but IMEI is 15 digits
-	s = strings.TrimLeft(s, "0")
-	if len(s) > 15 {
-		s = s[len(s)-15:]
+	if len(s) >= 15 {
+		return s[len(s)-15:]
 	}
-	if len(s) == 0 {
-		return "000000000000000"
-	}
-	return s
+	return fmt.Sprintf("%015s", s)
 }
 
-// CRC-ITU (CRC-16/CCITT-FALSE style)
 func crcITU(data []byte) uint16 {
 	var crc uint16 = 0xFFFF
 	for _, b := range data {
@@ -602,7 +589,7 @@ func crcITU(data []byte) uint16 {
 }
 
 // =====================================================
-//                 UNIGUARD HANDLER (S168#...$)
+//                    UNIGUARD
 // =====================================================
 
 func handleUniGuard(br *bufio.Reader, conn net.Conn) {
@@ -610,8 +597,8 @@ func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 	vLog("📡 UniGuard connection from %s", remote)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(20 * time.Minute))
-		line, err := br.ReadString('$') // packets end with '$'
+		conn.SetReadDeadline(time.Now().Add(30 * time.Minute))
+		line, err := br.ReadString('$')
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				vLog("⏱ UniGuard timeout, closing %s", remote)
@@ -631,8 +618,10 @@ func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 
 		imei, serialHex, rec, ok := parseUniGuard(msg)
 		if !ok {
+			vLog("⚠️ UniGuard parse failed (no GDATA?)")
 			continue
 		}
+		vLog("✅ UniGuard IMEI=%s serial=%s", imei, serialHex)
 
 		deviceID, err := ensureDevice(imei)
 		if err != nil {
@@ -642,34 +631,28 @@ func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 
 		processOnePosition(deviceID, imei, rec)
 
-		// send ACK (minimal)
 		ack := buildUniGuardAck("S168", imei, serialHex, "LOCA")
 		_, _ = conn.Write([]byte(ack))
 	}
 }
 
 func parseUniGuard(msg string) (imei string, serialHex string, rec *AVLData, ok bool) {
-	// Format: ID#IMEI#serial#length#content$ :contentReference[oaicite:13]{index=13}
 	msg = strings.TrimSuffix(msg, "$")
 	parts := strings.Split(msg, "#")
 	if len(parts) < 5 {
 		return "", "", nil, false
 	}
-
-	// Normalize
 	for i := range parts {
 		parts[i] = strings.TrimSpace(parts[i])
 	}
+	imei = parts[1]
+	serialHex = parts[2]
 
-	imei = strings.TrimSpace(parts[1])
-	serialHex = strings.TrimSpace(parts[2])
-
-	content := strings.TrimSpace(strings.Join(parts[4:], "#")) // in case content has '#'
+	content := strings.TrimSpace(strings.Join(parts[4:], "#"))
 	if content == "" {
 		return imei, serialHex, nil, false
 	}
 
-	// Find GDATA: ... ;  :contentReference[oaicite:14]{index=14}
 	sections := strings.Split(content, ";")
 	var gdata string
 	for _, s := range sections {
@@ -683,23 +666,21 @@ func parseUniGuard(msg string) (imei string, serialHex string, rec *AVLData, ok 
 		return imei, serialHex, nil, false
 	}
 
-	// Example: GDATA: A, 12,160412154800,22.564025,113.242329,5.5,152,900 :contentReference[oaicite:15]{index=15}
 	fields := splitCSVLoose(gdata)
 	if len(fields) < 8 {
 		return imei, serialHex, nil, false
 	}
 
-	// fields[0] = A/V
-	sats, _ := strconv.Atoi(strings.TrimSpace(fields[1]))
-	tRaw := strings.TrimSpace(fields[2])
-	lat, _ := strconv.ParseFloat(strings.TrimSpace(fields[3]), 64)
-	lon, _ := strconv.ParseFloat(strings.TrimSpace(fields[4]), 64)
-	speedF, _ := strconv.ParseFloat(strings.TrimSpace(fields[5]), 64)
-	headingF, _ := strconv.ParseFloat(strings.TrimSpace(fields[6]), 64)
-	altF, _ := strconv.ParseFloat(strings.TrimSpace(fields[7]), 64)
+	// Example: A,12,160412154800,22.564025,113.242329,5.5,152,900
+	sats, _ := strconv.Atoi(fields[1])
+	tRaw := fields[2]
+	lat, _ := strconv.ParseFloat(fields[3], 64)
+	lon, _ := strconv.ParseFloat(fields[4], 64)
+	speedF, _ := strconv.ParseFloat(fields[5], 64)
+	headingF, _ := strconv.ParseFloat(fields[6], 64)
+	altF, _ := strconv.ParseFloat(fields[7], 64)
 
 	ts := time.Now().UTC()
-	// time format: yymmddhhmmss (year 2 digits) per doc description/example :contentReference[oaicite:16]{index=16}
 	if len(tRaw) >= 12 {
 		if t, err := time.ParseInLocation("060102150405", tRaw[:12], time.UTC); err == nil {
 			ts = t
@@ -720,7 +701,6 @@ func parseUniGuard(msg string) (imei string, serialHex string, rec *AVLData, ok 
 }
 
 func splitCSVLoose(s string) []string {
-	// split on commas, trim spaces, and remove empty tokens
 	raw := strings.Split(s, ",")
 	out := make([]string, 0, len(raw))
 	for _, r := range raw {
@@ -733,17 +713,15 @@ func splitCSVLoose(s string) []string {
 	return out
 }
 
-// Downstream ACK format: S168 # IMEI # serial # length # ACK ^ LOCA, parameter :contentReference[oaicite:17]{index=17}
 func buildUniGuardAck(id, imei, serialHex, keyword string) string {
+	// ACK^LOCA (device expects similar)
 	content := "ACK^" + keyword
-	// length is hex length of content portion (characters count), excluding '#' and '$' :contentReference[oaicite:18]{index=18}
 	lengthHex := fmt.Sprintf("%04x", len(content))
-	// Keep same header style (with spaces around # is tolerated; but devices often accept no spaces)
 	return fmt.Sprintf("%s#%s#%s#%s#%s$", id, imei, serialHex, lengthHex, content)
 }
 
 // =====================================================
-//                 SHARED PROCESSING
+//           SHARED: POSITION PROCESSING + VALIDATION
 // =====================================================
 
 func processOnePosition(deviceID int, imei string, rec *AVLData) {
@@ -751,7 +729,6 @@ func processOnePosition(deviceID int, imei string, rec *AVLData) {
 		return
 	}
 
-	// Common validation (same rules you use)
 	if rec.Latitude == 0 || rec.Longitude == 0 {
 		vLog("⚠️ Skipping zero coordinates (imei=%s): LAT=%.7f LNG=%.7f", imei, rec.Latitude, rec.Longitude)
 		return
@@ -790,31 +767,49 @@ func processOnePosition(deviceID int, imei string, rec *AVLData) {
 //                 IMEI / DEVICE HANDLING
 // =====================================================
 
-// Keep your original exported behavior, but implement via reader-safe helper.
 func readIMEI(conn net.Conn) (string, error) {
 	br := bufio.NewReaderSize(conn, 64*1024)
 	return readIMEIFromReader(br, conn)
 }
 
-// Teltonika IMEI handshake: read first bytes and parse digits, then ACK 0x01
+// Teltonika handshake. Reads only the IMEI bytes, and does NOT swallow the AVL packet.
 func readIMEIFromReader(br *bufio.Reader, conn net.Conn) (string, error) {
-	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := br.Read(buf)
-	conn.SetReadDeadline(time.Time{})
+	conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
+	p2, err := br.Peek(2)
 	if err != nil {
 		return "", err
 	}
 
-	raw := buf[:n]
-	if len(raw) >= 2 && raw[0] == 0x00 && raw[1] == 0x0F {
-		raw = raw[2:]
+	var raw []byte
+	if len(p2) == 2 && p2[0] == 0x00 && p2[1] == 0x0F {
+		_, _ = br.ReadByte()
+		_, _ = br.ReadByte()
+
+		imeiBytes := make([]byte, 15)
+		if _, err := io.ReadFull(br, imeiBytes); err != nil {
+			return "", err
+		}
+		raw = imeiBytes
+	} else {
+		// fallback: read small chunk and extract digits
+		buf := make([]byte, 64)
+		n, err := br.Read(buf)
+		if err != nil {
+			return "", err
+		}
+		raw = buf[:n]
 	}
 
 	re := regexp.MustCompile(`\D`)
 	imei := re.ReplaceAllString(string(raw), "")
+	if imei == "" {
+		return "", fmt.Errorf("empty IMEI after parsing")
+	}
 
-	_, _ = conn.Write([]byte{0x01}) // ACK
+	// Teltonika requires 0x01 ack after IMEI
+	_, _ = conn.Write([]byte{0x01})
 	return imei, nil
 }
 
@@ -955,7 +950,10 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		return v
 	}
 
-	// 1-byte values
+	// event io id + total io count (codec8/8e structure usually includes these)
+	_ = readByte() // eventIO (ignored)
+	_ = readByte() // totalIO (ignored)
+
 	n1 := int(readByte())
 	for i := 0; i < n1; i++ {
 		id := readByte()
@@ -963,7 +961,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 2-byte values
 	n2 := int(readByte())
 	for i := 0; i < n2; i++ {
 		id := readByte()
@@ -971,7 +968,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 4-byte values
 	n4 := int(readByte())
 	for i := 0; i < n4; i++ {
 		id := readByte()
@@ -979,7 +975,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 8-byte values
 	n8 := int(readByte())
 	for i := 0; i < n8; i++ {
 		id := readByte()
@@ -1068,13 +1063,6 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 	return nil
 }
 
-func sendACK(conn net.Conn, count int) {
-	ack := make([]byte, 5)
-	binary.BigEndian.PutUint32(ack, uint32(count))
-	ack[4] = 0x01
-	_, _ = conn.Write(ack)
-}
-
 // =====================================================
 //                 UTILITY
 // =====================================================
@@ -1087,7 +1075,7 @@ func getEnv(key, def string) string {
 	return val
 }
 
-// (Optional helper if you ever need strict hex parsing for UniGuard serial/len)
+// optional tiny helpers
 func parseHexU16(s string) uint16 {
 	s = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(s), "0x"))
 	if s == "" {
