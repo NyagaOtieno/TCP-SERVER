@@ -142,15 +142,38 @@ const (
 	ProtoUniGuard
 )
 
+func (p ProtocolKind) String() string {
+	switch p {
+	case ProtoGT06:
+		return "GT06"
+	case ProtoUniGuard:
+		return "UNIGUARD"
+	default:
+		return "TELTONIKA/UNKNOWN"
+	}
+}
+
 func detectProtocolPeek(br *bufio.Reader) ProtocolKind {
-	peek, _ := br.Peek(16)
+	peek, _ := br.Peek(32)
+
+	// GT06 binary starts 0x78 0x78
 	if len(peek) >= 2 && peek[0] == 0x78 && peek[1] == 0x78 {
 		return ProtoGT06
 	}
-	// UniGuard packets are ASCII starting with Sxxx#... ending with $
-	if len(peek) >= 1 && (peek[0] == 'S' || peek[0] == 's') && bytes.Contains(peek, []byte("#")) {
-		return ProtoUniGuard
+
+	// UniGuard is ASCII starts with 'S' and contains '#'
+	if len(peek) >= 1 && (peek[0] == 'S' || peek[0] == 's') {
+		if bytes.Contains(peek, []byte("#")) {
+			return ProtoUniGuard
+		}
 	}
+
+	// Teltonika IMEI handshake 0x00 0x0F + 15 ASCII digits
+	if len(peek) >= 2 && peek[0] == 0x00 && peek[1] == 0x0F {
+		return ProtoTeltonika
+	}
+
+	// Unknown -> treat as teltonika/unknown, but we will do safe fallbacks
 	return ProtoTeltonika
 }
 
@@ -167,13 +190,38 @@ func handleConnection(conn net.Conn) {
 		vLog("👀 First bytes: %s", hex.EncodeToString(p))
 	}
 
-	switch detectProtocolPeek(br) {
+	kind := detectProtocolPeek(br)
+	vLog("🧭 Protocol guess from %s: %s", remote, kind.String())
+
+	switch kind {
 	case ProtoGT06:
 		handleGT06(br, conn)
+		return
 	case ProtoUniGuard:
 		handleUniGuard(br, conn)
+		return
 	default:
-		handleTeltonika(br, conn)
+		// Try Teltonika IMEI handshake ONLY if header matches 00 0F.
+		imei, err := readTeltonikaIMEIHandshake(br, conn)
+		if err == nil {
+			handleTeltonikaAfterIMEI(br, conn, imei)
+			return
+		}
+
+		// Fallbacks (do not consume bytes)
+		if p, _ := br.Peek(2); len(p) == 2 && p[0] == 0x78 && p[1] == 0x78 {
+			vLog("🔁 Fallback detected GT06 after Teltonika IMEI fail")
+			handleGT06(br, conn)
+			return
+		}
+		if p, _ := br.Peek(1); len(p) == 1 && (p[0] == 'S' || p[0] == 's') {
+			vLog("🔁 Fallback detected UniGuard after Teltonika IMEI fail")
+			handleUniGuard(br, conn)
+			return
+		}
+
+		vLog("⚠️ Unknown protocol from %s (no Teltonika IMEI / no GT06 / no UniGuard). Closing.", remote)
+		return
 	}
 }
 
@@ -181,14 +229,40 @@ func handleConnection(conn net.Conn) {
 //                    TELTONIKA (FMB/FMC)
 // =====================================================
 
-func handleTeltonika(br *bufio.Reader, conn net.Conn) {
-	remote := conn.RemoteAddr().String()
+// Reads ONLY Teltonika IMEI handshake if it matches 00 0F.
+// If it isn't Teltonika, it returns error WITHOUT consuming bytes.
+func readTeltonikaIMEIHandshake(br *bufio.Reader, conn net.Conn) (string, error) {
+	conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
 
-	imei, err := readIMEIFromReader(br, conn)
+	p2, err := br.Peek(2)
 	if err != nil {
-		vLog("❌ Failed IMEI read (Teltonika) from %s: %v", remote, err)
-		return
+		return "", err
 	}
+	if len(p2) < 2 || p2[0] != 0x00 || p2[1] != 0x0F {
+		return "", fmt.Errorf("not a teltonika IMEI header")
+	}
+
+	// consume 2 header bytes
+	_, _ = br.ReadByte()
+	_, _ = br.ReadByte()
+
+	imeiBytes := make([]byte, 15)
+	if _, err := io.ReadFull(br, imeiBytes); err != nil {
+		return "", err
+	}
+
+	imei := strings.TrimSpace(string(imeiBytes))
+	if !regexp.MustCompile(`^\d{15}$`).MatchString(imei) {
+		return "", fmt.Errorf("invalid teltonika imei: %q", imei)
+	}
+
+	// Teltonika requires 0x01 ACK after IMEI
+	_, _ = conn.Write([]byte{0x01})
+	return imei, nil
+}
+
+func handleTeltonikaAfterIMEI(br *bufio.Reader, conn net.Conn, imei string) {
 	vLog("📡 Teltonika device connected: %s", imei)
 
 	deviceID, err := ensureDevice(imei)
@@ -218,20 +292,21 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-		// Teltonika frame format:
+		// Teltonika frame:
 		// 4 bytes preamble (00000000)
 		// 4 bytes data length (N)
-		// N bytes data (Codec8/8E payload)
+		// N bytes data (codec8/8e...)
 		// 4 bytes CRC
 		for {
 			if len(residual) < 8 {
 				break
 			}
 
-			// resync to preamble
+			// resync to preamble 00000000
 			if binary.BigEndian.Uint32(residual[:4]) != 0 {
 				idx := bytes.Index(residual, []byte{0x00, 0x00, 0x00, 0x00})
 				if idx == -1 {
+					// keep last few bytes in case preamble is split
 					if len(residual) > 3 {
 						residual = residual[len(residual)-3:]
 					}
@@ -256,7 +331,7 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 			}
 
 			data := residual[8 : 8+dataLen]
-			// crc := residual[8+dataLen : total] // available if you want validate CRC
+			// crc := residual[8+dataLen : total] // available if you later want to validate
 			_ = residual[8+dataLen : total]
 
 			codecPayload, err := normalizeToCodec8(data)
@@ -279,14 +354,17 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 					continue
 				}
 
+				// Skip zero coordinates
 				if r.Latitude == 0 || r.Longitude == 0 {
 					vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
 					continue
 				}
+				// Skip records without satellites
 				if r.Satellites == 0 {
 					vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
 					continue
 				}
+				// Skip out-of-range coordinates
 				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
 					vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
 					continue
@@ -317,9 +395,10 @@ func handleTeltonika(br *bufio.Reader, conn net.Conn) {
 			}
 			_ = postPositionsToBackend(payload)
 
-			// ✅ Correct Teltonika ACK: 4-byte accepted records count
+			// ✅ Correct Teltonika ACK: 4 bytes accepted record count
 			sendTeltonikaACK(conn, len(valid))
 
+			// consume frame
 			residual = residual[total:]
 		}
 	}
@@ -479,7 +558,7 @@ func parseGT06Location(raw []byte) (*AVLData, bool) {
 	}
 	body := raw[3 : 3+length] // proto..crc
 
-	if len(body) < 1+6+1+4+4+1+2+2+2 {
+	if len(body) < 1+6+1+4+4+1+2 {
 		return nil, false
 	}
 
@@ -618,7 +697,7 @@ func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 
 		imei, serialHex, rec, ok := parseUniGuard(msg)
 		if !ok {
-			vLog("⚠️ UniGuard parse failed (no GDATA?)")
+			vLog("⚠️ UniGuard parse failed (no/short GDATA?)")
 			continue
 		}
 		vLog("✅ UniGuard IMEI=%s serial=%s", imei, serialHex)
@@ -714,7 +793,7 @@ func splitCSVLoose(s string) []string {
 }
 
 func buildUniGuardAck(id, imei, serialHex, keyword string) string {
-	// ACK^LOCA (device expects similar)
+	// ACK^LOCA (commonly accepted by UniGuard style devices)
 	content := "ACK^" + keyword
 	lengthHex := fmt.Sprintf("%04x", len(content))
 	return fmt.Sprintf("%s#%s#%s#%s#%s$", id, imei, serialHex, lengthHex, content)
@@ -764,54 +843,8 @@ func processOnePosition(deviceID int, imei string, rec *AVLData) {
 }
 
 // =====================================================
-//                 IMEI / DEVICE HANDLING
+//                 DEVICE HANDLING
 // =====================================================
-
-func readIMEI(conn net.Conn) (string, error) {
-	br := bufio.NewReaderSize(conn, 64*1024)
-	return readIMEIFromReader(br, conn)
-}
-
-// Teltonika handshake. Reads only the IMEI bytes, and does NOT swallow the AVL packet.
-func readIMEIFromReader(br *bufio.Reader, conn net.Conn) (string, error) {
-	conn.SetReadDeadline(time.Now().Add(8 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-
-	p2, err := br.Peek(2)
-	if err != nil {
-		return "", err
-	}
-
-	var raw []byte
-	if len(p2) == 2 && p2[0] == 0x00 && p2[1] == 0x0F {
-		_, _ = br.ReadByte()
-		_, _ = br.ReadByte()
-
-		imeiBytes := make([]byte, 15)
-		if _, err := io.ReadFull(br, imeiBytes); err != nil {
-			return "", err
-		}
-		raw = imeiBytes
-	} else {
-		// fallback: read small chunk and extract digits
-		buf := make([]byte, 64)
-		n, err := br.Read(buf)
-		if err != nil {
-			return "", err
-		}
-		raw = buf[:n]
-	}
-
-	re := regexp.MustCompile(`\D`)
-	imei := re.ReplaceAllString(string(raw), "")
-	if imei == "" {
-		return "", fmt.Errorf("empty IMEI after parsing")
-	}
-
-	// Teltonika requires 0x01 ack after IMEI
-	_, _ = conn.Write([]byte{0x01})
-	return imei, nil
-}
 
 func ensureDevice(imei string) (int, error) {
 	var id int
@@ -950,9 +983,11 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		return v
 	}
 
-	// event io id + total io count (codec8/8e structure usually includes these)
-	_ = readByte() // eventIO (ignored)
-	_ = readByte() // totalIO (ignored)
+	// codec8/8e IO:
+	// event IO id (1 byte)
+	// total IO count (1 byte)
+	_ = readByte()
+	_ = readByte()
 
 	n1 := int(readByte())
 	for i := 0; i < n1; i++ {
@@ -1075,7 +1110,6 @@ func getEnv(key, def string) string {
 	return val
 }
 
-// optional tiny helpers
 func parseHexU16(s string) uint16 {
 	s = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(s), "0x"))
 	if s == "" {
