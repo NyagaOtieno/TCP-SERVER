@@ -1,8 +1,8 @@
+// main.go
 package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -10,76 +10,58 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-/*
-GT06 key facts from your PDF:
-- Start: 0x78 0x78
-- Stop:  0x0D 0x0A
-- Length is 1 byte (counts: Protocol + Info + Serial(2) + CRC(2))
-- Server ACK example:
-  78 78 05 01 00 01 D9 DC 0D 0A  (login ack)   5
-  78 78 05 13 00 11 F9 70 0D 0A  (status ack)  6
-- Location packet (0x12) field layout example in doc. 7
-*/
-
-const (
-	defaultPort = 5027
-
-	// Teltonika IMEI "login" is: 0x00 0x0F + 15 ASCII digits (IMEI)
-	teltonikaIMEIPrefixHi = 0x00
-	teltonikaIMEIPrefixLo = 0x0F
-
-	// GT06 framing
-	gt06Start1 = 0x78
-	gt06Start2 = 0x78
-	gt06Stop1  = 0x0D
-	gt06Stop2  = 0x0A
-
-	// GT06 protocol numbers (common)
-	gt06ProtoLogin    = 0x01
-	gt06ProtoLocation = 0x12
-	gt06ProtoStatus   = 0x13 // "P13" heartbeat/status packet in your logs/doc 8
-)
-
-type ConnState struct {
-	Proto string // "teltonika" or "gt06" or ""
-	IMEI  string
-	Buf   []byte
-}
-
 func main() {
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	addr := env("LISTEN_ADDR", ":5027")
 
-	port := envInt("PORT", defaultPort)
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	// UDP
 	go func() {
-		defer wg.Done()
-		startTCP(addr)
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			log.Fatalf("UDP resolve error: %v", err)
+		}
+		pc, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			log.Fatalf("UDP listen error: %v", err)
+		}
+		defer pc.Close()
+
+		log.Printf("UDP Listening on %s", addr)
+
+		buf := make([]byte, 4096)
+		for {
+			n, raddr, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				log.Printf("UDP read error: %v", err)
+				continue
+			}
+			data := append([]byte(nil), buf[:n]...)
+			log.Printf("UDP FROM %s RAW (%d): %s", raddr.String(), len(data), hex.EncodeToString(data))
+
+			// Try parse GT06
+			if ack, ok := handleGT06Datagram(data); ok {
+				_, _ = pc.WriteToUDP(ack, raddr)
+				log.Printf("UDP TO %s ACK: %s", raddr.String(), hex.EncodeToString(ack))
+				continue
+			}
+
+			// Try parse P13/S168 (sometimes sent over UDP as ASCII)
+			if resp, ok := handleP13MessageBytes(data); ok {
+				_, _ = pc.WriteToUDP([]byte(resp), raddr)
+				log.Printf("UDP TO %s P13 ACK: %q", raddr.String(), resp)
+				continue
+			}
+
+			log.Printf("UDP FROM %s Unknown packet", raddr.String())
+		}
 	}()
-	go func() {
-		defer wg.Done()
-		startUDP(addr)
-	}()
 
-	wg.Wait()
-}
-
-// =======================
-// TCP
-// =======================
-
-func startTCP(addr string) {
+	// TCP
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("TCP listen failed: %v", err)
+		log.Fatalf("TCP listen error: %v", err)
 	}
 	defer ln.Close()
 	log.Printf("TCP Listening on %s", addr)
@@ -94,392 +76,326 @@ func startTCP(addr string) {
 	}
 }
 
+// ---------------------------
+// TCP handler (stream parser)
+// ---------------------------
 func handleTCPConn(c net.Conn) {
 	defer c.Close()
-
 	remote := c.RemoteAddr().String()
 	log.Printf("TCP New connection: %s", remote)
 
-	st := &ConnState{Buf: make([]byte, 0, 4096)}
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Minute))
 
+	var buf []byte
 	tmp := make([]byte, 4096)
+
 	for {
-		_ = c.SetReadDeadline(time.Now().Add(3 * time.Minute))
 		n, err := c.Read(tmp)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				log.Printf("TCP timeout: %s", remote)
-			} else {
-				log.Printf("TCP closed: %s (%v)", remote, err)
-			}
+			log.Printf("TCP %s closed: %v", remote, err)
 			return
 		}
-		if n <= 0 {
-			continue
-		}
-
 		chunk := tmp[:n]
-		log.Printf("TCP RAW (%d bytes): %s", len(chunk), hex.EncodeToString(chunk))
-		st.Buf = append(st.Buf, chunk...)
+		log.Printf("TCP %s RAW (%d): %s", remote, n, hex.EncodeToString(chunk))
+		buf = append(buf, chunk...)
 
-		// Decide protocol as soon as we can
-		if st.Proto == "" {
-			if looksLikeTeltonikaIMEI(st.Buf) {
-				st.Proto = "teltonika"
-			} else if bytes.Contains(st.Buf, []byte{gt06Start1, gt06Start2}) {
-				st.Proto = "gt06"
+		// Parse as many frames/messages as possible
+		for {
+			if len(buf) == 0 {
+				break
 			}
-		}
 
-		switch st.Proto {
-		case "teltonika":
-			if err := processTeltonikaTCP(c, st); err != nil {
-				log.Printf("Teltonika error (%s): %v", remote, err)
-				return
+			// 1) P13 / UniGuard S168 ASCII ends with '$'
+			if idx := bytes.IndexByte(buf, '$'); idx >= 0 {
+				// If it looks like it contains S168 before '$', treat it as P13
+				part := buf[:idx+1]
+				if bytes.Contains(part, []byte("S168")) {
+					resp, ok := handleP13MessageBytes(part)
+					if ok {
+						_, _ = c.Write([]byte(resp))
+						log.Printf("TCP %s P13 ACK: %q", remote, resp)
+					} else {
+						log.Printf("TCP %s P13 parse failed: %q", remote, string(part))
+					}
+					buf = buf[idx+1:]
+					continue
+				}
 			}
-		case "gt06":
-			if err := processGT06StreamTCP(c, st); err != nil {
-				log.Printf("GT06 error (%s): %v", remote, err)
-				return
+
+			// 2) GT06 binary frames (7878 or 7979)
+			if ack, consumed, ok := parseAndAckGT06FromStream(buf); ok {
+				if len(ack) > 0 {
+					_, _ = c.Write(ack)
+					log.Printf("TCP %s GT06 ACK: %s", remote, hex.EncodeToString(ack))
+				}
+				buf = buf[consumed:]
+				continue
 			}
-		default:
-			// Not sure yet; keep buffering until we can detect
-			if len(st.Buf) > 8192 {
-				log.Printf("Unknown protocol, dropping buffer (%s)", remote)
-				st.Buf = st.Buf[:0]
+
+			// 3) Teltonika IMEI handshake pattern (00 0F + ASCII digits) - optional fallback
+			// Your logs show this for FMB920. If seen, ACK 0x01 and keep going.
+			if imei, consumed, ok := parseTeltonikaIMEIHandshake(buf); ok {
+				log.Printf("TCP %s Teltonika IMEI: %s", remote, imei)
+				_, _ = c.Write([]byte{0x01})
+				log.Printf("TCP %s Sent Teltonika IMEI ACK: 01", remote)
+				buf = buf[consumed:]
+				continue
 			}
+
+			// Otherwise, discard 1 byte to resync
+			buf = buf[1:]
 		}
 	}
 }
 
-// =======================
-// UDP
-// =======================
+// ---------------------------
+// UniGuard / Bluebird P13 (S168)
+// ---------------------------
+//
+// Upstream example includes:
+// S168 # IMEI # serial # length # LOCA: G; CELL: ...; GDATA: ...; ALERT: ...; STATUS: ...; WAY: 0 $ 4
+// Downstream LOCA ACK:
+// S168 # IMEI # serial # length # ACK ^ LOCA, parameter 5
+//
+// Heartbeat/SYNC:
+// Upstream SYNC… 6
+// Downstream ACK^SYNC,time 7
+func handleP13MessageBytes(b []byte) (string, bool) {
+	s := string(b)
 
-func startUDP(addr string) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		log.Fatalf("UDP resolve failed: %v", err)
+	// keep only up to '$'
+	if i := strings.IndexByte(s, '$'); i >= 0 {
+		s = s[:i+1]
+	} else {
+		return "", false
 	}
 
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Fatalf("UDP listen failed: %v", err)
+	// Normalize: remove spaces around separators
+	s = strings.ReplaceAll(s, " ", "")
+	if !strings.HasPrefix(s, "S168#") && !strings.HasPrefix(s, "S168") {
+		return "", false
 	}
-	defer conn.Close()
+	s = strings.TrimSuffix(s, "$")
 
-	log.Printf("UDP Listening on %s", addr)
-
-	buf := make([]byte, 4096)
-	for {
-		n, raddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("UDP read error: %v", err)
-			continue
-		}
-		data := append([]byte(nil), buf[:n]...)
-		log.Printf("UDP RAW (%d bytes) from %s: %s", n, raddr.String(), hex.EncodeToString(data))
-
-		// Most UniGuard/GT06 devices send GT06 frames over UDP too
-		if !bytes.HasPrefix(data, []byte{gt06Start1, gt06Start2}) || len(data) < 10 {
-			log.Printf("UDP unsupported packet (not 7878...) from %s", raddr.String())
-			continue
-		}
-
-		// Handle a single GT06 datagram (it may contain exactly 1 frame)
-		frame, ok := extractOneGT06Frame(data)
-		if !ok {
-			log.Printf("UDP could not extract a full GT06 frame from %s", raddr.String())
-			continue
-		}
-
-		info, err := parseGT06Frame(frame)
-		if err != nil {
-			log.Printf("UDP GT06 parse error from %s: %v", raddr.String(), err)
-			continue
-		}
-
-		ack := buildGT06Ack(info.Protocol, info.Serial)
-		_, _ = conn.WriteToUDP(ack, raddr)
-		log.Printf("UDP Sent GT06 ACK to %s: %s", raddr.String(), hex.EncodeToString(ack))
-	}
-}
-
-// =======================
-// Teltonika (TCP)
-// =======================
-
-func looksLikeTeltonikaIMEI(b []byte) bool {
-	// Expect at least 17 bytes: 00 0F + 15 ASCII digits
-	if len(b) < 17 {
-		return false
-	}
-	return b[0] == teltonikaIMEIPrefixHi && b[1] == teltonikaIMEIPrefixLo
-}
-
-func processTeltonikaTCP(c net.Conn, st *ConnState) error {
-	// Step 1: read IMEI if not yet read
-	if st.IMEI == "" {
-		if len(st.Buf) < 17 {
-			return nil // wait more
-		}
-		raw := st.Buf[:17]
-		st.Buf = st.Buf[17:]
-
-		imeiBytes := raw[2:] // after 00 0F
-		imei := strings.TrimSpace(string(imeiBytes))
-		imei = onlyDigits(imei)
-
-		st.IMEI = imei
-		log.Printf("TCP Teltonika IMEI: %s", st.IMEI)
-
-		// Teltonika expects single byte 0x01 on IMEI accept
-		_, _ = c.Write([]byte{0x01})
-		log.Printf("TCP Sent Teltonika IMEI ACK: 01")
+	parts := strings.Split(s, "#")
+	if len(parts) < 5 {
+		return "", false
 	}
 
-	// Step 2: parse AVL frames: [00000000][dataLen:4][data:dataLen][crc:4]
-	for {
-		if len(st.Buf) < 8 {
-			return nil
-		}
-		// Must start with 4 zero preamble
-		if !bytes.Equal(st.Buf[:4], []byte{0, 0, 0, 0}) {
-			// resync: drop 1 byte
-			st.Buf = st.Buf[1:]
-			continue
-		}
+	head := parts[0] // "S168" (sometimes could include "S168" only)
+	imei := parts[1]
+	serial := parts[2]
+	// length := parts[3] // device-sent length (we don't strictly require it)
+	content := strings.Join(parts[4:], "#")
 
-		dataLen := int(binary.BigEndian.Uint32(st.Buf[4:8]))
-		if dataLen <= 0 || dataLen > 1024*1024 {
-			// invalid, resync
-			st.Buf = st.Buf[1:]
-			continue
-		}
+	_ = head
 
-		total := 8 + dataLen + 4
-		if len(st.Buf) < total {
-			return nil // wait more
-		}
+	msgType := detectP13Type(content) // LOCA / SYNC / RET / other
+	switch msgType {
+	case "LOCA":
+		// ACK^LOCA (parameter optional per doc) 8
+		ackBody := "ACK^LOCA"
+		return buildP13Downstream(imei, serial, ackBody), true
 
-		frame := st.Buf[:total]
-		st.Buf = st.Buf[total:]
+	case "SYNC":
+		// ACK^SYNC,yyyymmddhhmmss 9
+		nowUTC := time.Now().UTC().Format("20060102150405")
+		ackBody := "ACK^SYNC," + nowUTC
+		return buildP13Downstream(imei, serial, ackBody), true
 
-		// Try to read AVL record count (codec8/8E)
-		count := teltonikaAVLCount(frame)
-		log.Printf("TCP Teltonika AVL received: dataLen=%d records=%d imei=%s", dataLen, count, st.IMEI)
-
-		// Correct Teltonika response is 4 bytes: number of records (NOT 5 bytes)
-		ack := make([]byte, 4)
-		binary.BigEndian.PutUint32(ack, uint32(count))
-		_, _ = c.Write(ack)
-		log.Printf("TCP Sent Teltonika AVL ACK: %s", hex.EncodeToString(ack))
+	default:
+		// Generic RET ack
+		ackBody := "ACK^" + msgType
+		return buildP13Downstream(imei, serial, ackBody), true
 	}
 }
 
-func teltonikaAVLCount(frame []byte) int {
-	// frame: 4 preamble + 4 len + data + 4 crc
-	if len(frame) < 8+2 {
-		return 0
+func detectP13Type(content string) string {
+	// Handles "LOCA:" / "SYNC:" and also "SYNC,BEAT:..." style 10
+	up := strings.ToUpper(content)
+	if strings.HasPrefix(up, "LOCA:") || strings.HasPrefix(up, "LOCA,") {
+		return "LOCA"
 	}
-	dataLen := int(binary.BigEndian.Uint32(frame[4:8]))
-	if len(frame) < 8+dataLen {
-		return 0
+	if strings.HasPrefix(up, "SYNC:") || strings.HasPrefix(up, "SYNC,") {
+		return "SYNC"
 	}
-	data := frame[8 : 8+dataLen]
-	// Data layout: codecID (1), recordCount (1), records..., recordCount (1), crc16? etc depends.
-	if len(data) < 2 {
-		return 0
+	if strings.HasPrefix(up, "RET,") || strings.HasPrefix(up, "RET:") {
+		return "RET"
 	}
-	return int(data[1])
-}
-
-// =======================
-// GT06 (TCP/UDP)
-// =======================
-
-type GT06Info struct {
-	Protocol byte
-	Serial   uint16
-	IMEI     string // for login packets
-	// For location packets (0x12)
-	Lat   float64
-	Lon   float64
-	Speed int
-	Time  time.Time
-}
-
-func processGT06StreamTCP(c net.Conn, st *ConnState) error {
-	for {
-		frame, ok := extractOneGT06Frame(st.Buf)
-		if !ok {
-			// no full frame yet
-			if len(st.Buf) > 65535 {
-				st.Buf = st.Buf[:0]
+	// Fallback: take token up to ':' or ','
+	for i, ch := range up {
+		if ch == ':' || ch == ',' {
+			if i == 0 {
+				break
 			}
-			return nil
+			return up[:i]
+		}
+	}
+	return "UNKNOWN"
+}
+
+func buildP13Downstream(imei, serial, ackBody string) string {
+	// Downstream: S168#IMEI#serial#length#<content>$  (examples in doc) 11
+	// length is hex (0000-ffff). We set it to the length of ackBody (safe + consistent).
+	l := fmt.Sprintf("%04x", len(ackBody))
+	return fmt.Sprintf("S168#%s#%s#%s#%s$", imei, serial, l, ackBody)
+}
+
+// ---------------------------
+// GT06
+// ---------------------------
+//
+// Login packet and response structure shown in PDF 12
+// CRC-ITU: calculated from Packet Length through Information Serial Number 13
+func parseAndAckGT06FromStream(buf []byte) (ack []byte, consumed int, ok bool) {
+	// resync: find 7878 or 7979
+	start := findGT06Start(buf)
+	if start < 0 {
+		return nil, 0, false
+	}
+	if start > 0 {
+		// drop bytes before start
+		return nil, start, true
+	}
+
+	// 0x78 0x78 format: [78 78] [len1] [proto] ... [serial2] [crc2] [0D 0A]
+	if len(buf) >= 3 && buf[0] == 0x78 && buf[1] == 0x78 {
+		if len(buf) < 5 {
+			return nil, 0, false
+		}
+		l := int(buf[2])
+		total := 2 + 1 + l + 2
+		if len(buf) < total {
+			return nil, 0, false
+		}
+		frame := buf[:total]
+		if frame[total-2] != 0x0D || frame[total-1] != 0x0A {
+			// not a full valid frame; resync by dropping 1 byte
+			return nil, 1, true
 		}
 
-		// consume
-		st.Buf = st.Buf[len(frame):]
-
-		info, err := parseGT06Frame(frame)
-		if err != nil {
-			log.Printf("TCP GT06 parse error: %v | frame=%s", err, hex.EncodeToString(frame))
-			continue
+		// CRC check (optional but helpful)
+		crcGot := uint16(frame[total-4])<<8 | uint16(frame[total-3])
+		crcCalc := crcITU(frame[2 : total-4]) // from len to end of serial 14
+		if crcGot != crcCalc {
+			log.Printf("GT06 CRC mismatch got=%04x calc=%04x (continuing anyway)", crcGot, crcCalc)
 		}
 
-		// Log useful decoded fields
-		switch info.Protocol {
-		case gt06ProtoLogin:
-			log.Printf("TCP GT06 LOGIN imei=%s serial=%d", info.IMEI, info.Serial)
-		case gt06ProtoLocation:
-			log.Printf("TCP GT06 LOCATION lat=%.6f lon=%.6f speed=%d time=%s serial=%d",
-				info.Lat, info.Lon, info.Speed, info.Time.Format(time.RFC3339), info.Serial)
-		case gt06ProtoStatus:
-			log.Printf("TCP GT06 STATUS (P13/0x13) serial=%d", info.Serial) // 9
-		default:
-			log.Printf("TCP GT06 proto=0x%02X serial=%d", info.Protocol, info.Serial)
+		proto := frame[3]
+		serial := frame[total-6 : total-4] // 2 bytes before crc
+		ack = buildGT06Ack78(proto, serial)
+		logGT06(frame, proto)
+
+		return ack, total, true
+	}
+
+	// 0x79 0x79 format (some devices): [79 79] [len2] [proto] ... [serial2] [crc2] [0D 0A]
+	if len(buf) >= 4 && buf[0] == 0x79 && buf[1] == 0x79 {
+		if len(buf) < 8 {
+			return nil, 0, false
+		}
+		l := int(buf[2])<<8 | int(buf[3])
+		total := 2 + 2 + l + 2
+		if len(buf) < total {
+			return nil, 0, false
+		}
+		frame := buf[:total]
+		if frame[total-2] != 0x0D || frame[total-1] != 0x0A {
+			return nil, 1, true
 		}
 
-		ack := buildGT06Ack(info.Protocol, info.Serial)
-		_, _ = c.Write(ack)
-		log.Printf("TCP Sent GT06 ACK: %s", hex.EncodeToString(ack))
+		crcGot := uint16(frame[total-4])<<8 | uint16(frame[total-3])
+		crcCalc := crcITU(frame[2 : total-4]) // from len(2 bytes) to serial
+		if crcGot != crcCalc {
+			log.Printf("GT06(7979) CRC mismatch got=%04x calc=%04x (continuing anyway)", crcGot, crcCalc)
+		}
+
+		proto := frame[4]
+		serial := frame[total-6 : total-4]
+		ack = buildGT06Ack79(proto, serial)
+		logGT06(frame, proto)
+
+		return ack, total, true
+	}
+
+	return nil, 0, false
+}
+
+func handleGT06Datagram(data []byte) ([]byte, bool) {
+	ack, _, ok := parseAndAckGT06FromStream(data)
+	return ack, ok && len(ack) > 0
+}
+
+func findGT06Start(b []byte) int {
+	for i := 0; i+1 < len(b); i++ {
+		if (b[i] == 0x78 && b[i+1] == 0x78) || (b[i] == 0x79 && b[i+1] == 0x79) {
+			return i
+		}
+	}
+	return -1
+}
+
+func buildGT06Ack78(proto byte, serial []byte) []byte {
+	// Response example: 78 78 05 01 <serial2> <crc2> 0D 0A 15
+	// len=0x05 => proto(1) + serial(2) + crc(2)
+	out := []byte{0x78, 0x78, 0x05, proto, serial[0], serial[1], 0x00, 0x00, 0x0D, 0x0A}
+	crc := crcITU(out[2 : len(out)-4])
+	out[len(out)-4] = byte(crc >> 8)
+	out[len(out)-3] = byte(crc)
+	return out
+}
+
+func buildGT06Ack79(proto byte, serial []byte) []byte {
+	// Similar but with 2-byte length.
+	// len=0x0005
+	out := []byte{0x79, 0x79, 0x00, 0x05, proto, serial[0], serial[1], 0x00, 0x00, 0x0D, 0x0A}
+	crc := crcITU(out[2 : len(out)-4])
+	out[len(out)-4] = byte(crc >> 8)
+	out[len(out)-3] = byte(crc)
+	return out
+}
+
+func logGT06(frame []byte, proto byte) {
+	// If it's a login packet (0x01), terminal id is 8 bytes after proto 16
+	if proto == 0x01 {
+		// 7878: [0]=78 [1]=78 [2]=len [3]=proto [4..11]=terminal id
+		if len(frame) >= 12 && (frame[0] == 0x78 && frame[1] == 0x78) {
+			tid := frame[4:12]
+			imei := bcdIMEI(tid)
+			log.Printf("GT06 LOGIN IMEI: %s", imei)
+		}
+		// 7979: [0]=79 [1]=79 [2..3]=len [4]=proto [5..12]=terminal id
+		if len(frame) >= 13 && (frame[0] == 0x79 && frame[1] == 0x79) {
+			tid := frame[5:13]
+			imei := bcdIMEI(tid)
+			log.Printf("GT06(7979) LOGIN IMEI: %s", imei)
+		}
 	}
 }
 
-func extractOneGT06Frame(b []byte) ([]byte, bool) {
-	// Find start 78 78
-	i := bytes.Index(b, []byte{gt06Start1, gt06Start2})
-	if i < 0 {
-		return nil, false
+func bcdIMEI(b []byte) string {
+	// Terminal ID is 8 bytes BCD representing IMEI digits 17
+	var sb strings.Builder
+	for _, x := range b {
+		sb.WriteByte('0' + (x>>4)&0x0F)
+		sb.WriteByte('0' + x&0x0F)
 	}
-	if i > 0 {
-		// drop leading junk by returning a "virtual" frame length 0;
-		// caller will resync by consuming when we return nil/false, so we handle here:
-		b = b[i:]
+	s := sb.String()
+	s = strings.TrimLeft(s, "0")
+	// many devices want 15 digits; if longer, keep last 15
+	if len(s) > 15 {
+		s = s[len(s)-15:]
 	}
-
-	if len(b) < 5 {
-		return nil, false
-	}
-	// length byte at b[2]
-	L := int(b[2])
-	// total = start(2) + len(1) + L + stop(2)
-	total := 2 + 1 + L + 2
-	if total <= 0 || total > 2048 {
-		return nil, false
-	}
-	if len(b) < total {
-		return nil, false
-	}
-	frame := b[:total]
-	// validate stop bits
-	if frame[total-2] != gt06Stop1 || frame[total-1] != gt06Stop2 {
-		// not a real frame; try to resync by shifting one byte next loop
-		return nil, false
-	}
-	return frame, true
+	return s
 }
 
-func parseGT06Frame(frame []byte) (*GT06Info, error) {
-	// frame: 78 78 [len] [proto] [info...] [serialHi serialLo] [crcHi crcLo] 0D 0A
-	if len(frame) < 10 {
-		return nil, fmt.Errorf("frame too short")
-	}
-	if frame[0] != gt06Start1 || frame[1] != gt06Start2 {
-		return nil, fmt.Errorf("bad start")
-	}
-	if frame[len(frame)-2] != gt06Stop1 || frame[len(frame)-1] != gt06Stop2 {
-		return nil, fmt.Errorf("bad stop")
-	}
-
-	L := int(frame[2])
-	if 2+1+L+2 != len(frame) {
-		return nil, fmt.Errorf("length mismatch: L=%d total=%d", L, len(frame))
-	}
-
-	// CRC in packet (last 4 bytes before stop: [crcHi crcLo 0D 0A])
-	crcIn := binary.BigEndian.Uint16(frame[len(frame)-4 : len(frame)-2])
-
-	// CRC calculated over: [length .. serial] (exclude CRC itself and stop)
-	// That is bytes from frame[2] up to (but excluding) crc field.
-	crcCalc := crc16ITU(frame[2 : len(frame)-4])
-	if crcCalc != crcIn {
-		return nil, fmt.Errorf("crc mismatch: got=0x%04X calc=0x%04X", crcIn, crcCalc)
-	}
-
-	proto := frame[3]
-
-	// serial is always the 2 bytes right before CRC
-	serial := binary.BigEndian.Uint16(frame[len(frame)-6 : len(frame)-4])
-
-	infoStart := 4
-	infoEnd := len(frame) - 6 // up to serial
-	info := frame[infoStart:infoEnd]
-
-	out := &GT06Info{Protocol: proto, Serial: serial}
-
-	switch proto {
-	case gt06ProtoLogin:
-		// login info contains terminal ID (IMEI) in BCD (8 bytes) in example 10
-		if len(info) < 8 {
-			return out, nil
-		}
-		out.IMEI = bcdIMEI(info[:8])
-
-	case gt06ProtoLocation:
-		// See field layout in your doc: DateTime(6), GPS/Sats(1), Lat(4), Lon(4), Speed(1), Course/Status(2), ... 11
-		if len(info) < 6+1+4+4+1+2 {
-			return out, nil
-		}
-		out.Time = parseGT06Time(info[0:6])
-		gpsSat := info[6]
-		_ = gpsSat // available if you want later
-
-		latRaw := binary.BigEndian.Uint32(info[7:11])
-		lonRaw := binary.BigEndian.Uint32(info[11:15])
-
-		// GT06 uses degree * 30000 * 60 (common). Convert:
-		out.Lat = float64(latRaw) / 30000.0 / 60.0
-		out.Lon = float64(lonRaw) / 30000.0 / 60.0
-
-		out.Speed = int(info[15])
-
-	case gt06ProtoStatus:
-		// P13 status/heartbeat packet; we just ACK it correctly as shown in examples 12
-		// You can parse terminal info / voltage / GSM / alarm/lang if you want later.
-	}
-
-	return out, nil
-}
-
-func buildGT06Ack(protocol byte, serial uint16) []byte {
-	// ACK format shown in your doc examples:
-	// 78 78 05 [protocol] [serialHi serialLo] [crcHi crcLo] 0D 0A  13 14
-	ack := make([]byte, 10)
-	ack[0] = gt06Start1
-	ack[1] = gt06Start2
-	ack[2] = 0x05
-	ack[3] = protocol
-	binary.BigEndian.PutUint16(ack[4:6], serial)
-
-	crc := crc16ITU(ack[2:6]) // len + proto + serial
-	binary.BigEndian.PutUint16(ack[6:8], crc)
-
-	ack[8] = gt06Stop1
-	ack[9] = gt06Stop2
-	return ack
-}
-
-// CRC-ITU (CRC-16/IBM-SDLC / CRC-16/CCITT-FALSE variants differ; GT06 doc says CRC-ITU.
-// Common implementation used by GT06 servers is poly 0x1021, init 0xFFFF, no xorout.
-func crc16ITU(data []byte) uint16 {
+// CRC-ITU (CRC-16/CCITT-FALSE style used by GT06 docs) 18
+func crcITU(data []byte) uint16 {
 	var crc uint16 = 0xFFFF
 	for _, b := range data {
 		crc ^= uint16(b) << 8
 		for i := 0; i < 8; i++ {
-			if (crc & 0x8000) != 0 {
+			if crc&0x8000 != 0 {
 				crc = (crc << 1) ^ 0x1021
 			} else {
 				crc <<= 1
@@ -489,60 +405,51 @@ func crc16ITU(data []byte) uint16 {
 	return crc
 }
 
-// =======================
-// Helpers
-// =======================
+// ---------------------------
+// Teltonika IMEI handshake (optional)
+// ---------------------------
+func parseTeltonikaIMEIHandshake(buf []byte) (imei string, consumed int, ok bool) {
+	// Pattern: 00 0F + 15 ASCII digits (like your log "000f3335....")
+	if len(buf) < 2 {
+		return "", 0, false
+	}
+	if buf[0] != 0x00 || buf[1] != 0x0F {
+		return "", 0, false
+	}
+	if len(buf) < 2+15 {
+		return "", 0, false
+	}
+	raw := buf[2 : 2+15]
+	for _, ch := range raw {
+		if ch < '0' || ch > '9' {
+			return "", 0, false
+		}
+	}
+	return string(raw), 2 + 15, true
+}
 
-func envInt(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
+// ---------------------------
+// utils
+// ---------------------------
+func env(k, def string) string {
+	v := strings.TrimSpace(os.Getenv(k))
 	if v == "" {
 		return def
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
+	return v
 }
 
-func onlyDigits(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r >= '0' && r <= '9' {
-			b.WriteRune(r)
-		}
+func mustHexToInt(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
 	}
-	return b.String()
-}
-
-func bcdIMEI(b []byte) string {
-	// 8 bytes BCD → 16 digits, often last digit padded
-	var out strings.Builder
-	for _, x := range b {
-		hi := (x >> 4) & 0x0F
-		lo := x & 0x0F
-		out.WriteByte('0' + hi)
-		out.WriteByte('0' + lo)
+	// tries hex then decimal
+	if n, err := strconv.ParseInt(s, 16, 32); err == nil {
+		return int(n)
 	}
-	imei := strings.TrimLeft(out.String(), "0")
-	// many devices are 15 digits
-	if len(imei) > 15 {
-		imei = imei[len(imei)-15:]
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
 	}
-	return imei
-}
-
-func parseGT06Time(b []byte) time.Time {
-	// YY MM DD HH mm ss (all in hex/decimal values)
-	if len(b) != 6 {
-		return time.Now().UTC()
-	}
-	yy := int(b[0]) + 2000
-	mo := time.Month(b[1])
-	dd := int(b[2])
-	hh := int(b[3])
-	mm := int(b[4])
-	ss := int(b[5])
-	// assume UTC
-	return time.Date(yy, mo, dd, hh, mm, ss, 0, time.UTC)
+	return 0
 }
