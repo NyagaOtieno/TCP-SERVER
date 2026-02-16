@@ -264,8 +264,9 @@ sendACK(conn, len(valid))
 // =====================================================
 
 func readIMEI(conn net.Conn) (string, error) {
-	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Bigger buffer + longer deadline because cellular devices can be slow
+	buf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 	n, err := conn.Read(buf)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -273,6 +274,64 @@ func readIMEI(conn net.Conn) (string, error) {
 	}
 
 	raw := buf[:n]
+	vLog("🧾 IMEI-first-bytes (%d): %s", len(raw), strings.ToUpper(hex.EncodeToString(raw)))
+
+	// ----------------------------
+	// 1) GT06 / Uniguard / P13 style: 78 78 or 79 79
+	// ----------------------------
+	if len(raw) >= 5 && ((raw[0] == 0x78 && raw[1] == 0x78) || (raw[0] == 0x79 && raw[1] == 0x79)) {
+
+		// Try extract a full GT06 frame from the bytes we already got
+		frame, _, ok := extractGT06Frame(raw)
+		if !ok {
+			// We received partial frame; try read a bit more once
+			more := make([]byte, 2048)
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			m, e2 := conn.Read(more)
+			conn.SetReadDeadline(time.Time{})
+			if e2 == nil && m > 0 {
+				raw = append(raw, more[:m]...)
+				frame, _, ok = extractGT06Frame(raw)
+			}
+		}
+
+		if ok {
+			proto := gt06Protocol(frame)
+
+			// Login frame is usually proto 0x01
+			if proto == 0x01 {
+				imei := gt06ExtractIMEI(frame)
+				if imei == "" {
+					return "", fmt.Errorf("GT06 login detected but IMEI not parsed: %s", strings.ToUpper(hex.EncodeToString(frame)))
+				}
+
+				// Send GT06 login ACK
+				serial := gt06ExtractSerial(frame)
+				ack := buildGT06Ack(0x01, serial)
+				_, _ = conn.Write(ack)
+
+				vLog("✅ GT06 IMEI parsed: %s | ACK: %s", imei, strings.ToUpper(hex.EncodeToString(ack)))
+				return imei, nil
+			}
+
+			// If device sent heartbeat first, ACK it and keep going
+			serial := gt06ExtractSerial(frame)
+			if serial != nil {
+				ack := buildGT06Ack(proto, serial)
+				_, _ = conn.Write(ack)
+				vLog("ℹ️ GT06 pre-login proto=0x%02X ACK sent: %s", proto, strings.ToUpper(hex.EncodeToString(ack)))
+			}
+
+			// We still need IMEI; read another packet
+			return "", fmt.Errorf("GT06 frame received but not login (proto=0x%02X); waiting for login", proto)
+		}
+
+		return "", fmt.Errorf("GT06 header detected but incomplete frame: %s", strings.ToUpper(hex.EncodeToString(raw)))
+	}
+
+	// ----------------------------
+	// 2) Teltonika style: 00 0F + ASCII IMEI
+	// ----------------------------
 	if len(raw) >= 2 && raw[0] == 0x00 && raw[1] == 0x0F {
 		raw = raw[2:]
 	}
@@ -280,39 +339,16 @@ func readIMEI(conn net.Conn) (string, error) {
 	re := regexp.MustCompile(`\D`)
 	imei := re.ReplaceAllString(string(raw), "")
 
-	_, _ = conn.Write([]byte{0x01}) // ACK
+	if len(imei) < 10 {
+		return "", fmt.Errorf("could not parse Teltonika IMEI from: %s", strings.ToUpper(hex.EncodeToString(buf[:n])))
+	}
+
+	// Teltonika ACK
+	_, _ = conn.Write([]byte{0x01})
+	vLog("✅ Teltonika IMEI parsed: %s", imei)
 	return imei, nil
 }
 
-func ensureDevice(imei string) (int, error) {
-	var id int
-	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
-	if err == nil {
-		return id, nil
-	}
-
-	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	var devices []Device
-	if err := json.Unmarshal(body, &devices); err != nil {
-		return 0, err
-	}
-
-	for _, d := range devices {
-		if strings.TrimSpace(d.IMEI) == imei {
-			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
-			return d.ID, nil
-		}
-	}
-
-	return 0, fmt.Errorf("device IMEI %s not found", imei)
-}
 
 // =====================================================
 //                 TELTONIKA CODEC PARSING
@@ -539,6 +575,119 @@ func sendACK(conn net.Conn, count int) {
 	binary.BigEndian.PutUint32(ack, uint32(count))
 	ack[4] = 0x01
 	_, _ = conn.Write(ack)
+}
+func extractGT06Frame(buf []byte) (frame []byte, rest []byte, ok bool) {
+	// Find header 78 78 or 79 79
+	start := -1
+	for i := 0; i+1 < len(buf); i++ {
+		if (buf[i] == 0x78 && buf[i+1] == 0x78) || (buf[i] == 0x79 && buf[i+1] == 0x79) {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return nil, buf, false
+	}
+	if start > 0 {
+		buf = buf[start:]
+	}
+
+	if len(buf) < 5 {
+		return nil, buf, false
+	}
+
+	// 78 78: length = 1 byte at [2], total = length + 5
+	if buf[0] == 0x78 && buf[1] == 0x78 {
+		l := int(buf[2])
+		total := l + 5
+		if l <= 0 || total > 16384 || len(buf) < total {
+			return nil, buf, false
+		}
+		return buf[:total], buf[total:], true
+	}
+
+	// 79 79: length = 2 bytes at [2:4], total = length + 7
+	if buf[0] == 0x79 && buf[1] == 0x79 {
+		if len(buf) < 6 {
+			return nil, buf, false
+		}
+		l := int(binary.BigEndian.Uint16(buf[2:4]))
+		total := l + 7
+		if l <= 0 || total > 16384 || len(buf) < total {
+			return nil, buf, false
+		}
+		return buf[:total], buf[total:], true
+	}
+
+	return nil, buf, false
+}
+
+func gt06Protocol(frame []byte) byte {
+	if len(frame) < 5 {
+		return 0
+	}
+	if frame[0] == 0x78 && frame[1] == 0x78 {
+		return frame[3]
+	}
+	if frame[0] == 0x79 && frame[1] == 0x79 {
+		return frame[4]
+	}
+	return 0
+}
+
+func gt06ExtractSerial(frame []byte) []byte {
+	if len(frame) < 10 {
+		return nil
+	}
+	// tail: serial(2) crc(2) 0D 0A
+	return []byte{frame[len(frame)-6], frame[len(frame)-5]}
+}
+
+func gt06ExtractIMEI(frame []byte) string {
+	if gt06Protocol(frame) != 0x01 {
+		return ""
+	}
+	// Typical: 8 bytes BCD after proto
+	if len(frame) >= 12 && frame[0] == 0x78 && frame[1] == 0x78 {
+		return decodeBCDIMEI(frame[4:12])
+	}
+	if len(frame) >= 13 && frame[0] == 0x79 && frame[1] == 0x79 {
+		return decodeBCDIMEI(frame[5:13])
+	}
+	return ""
+}
+
+func decodeBCDIMEI(bcd []byte) string {
+	s := ""
+	for _, v := range bcd {
+		s += fmt.Sprintf("%02X", v)
+	}
+	return strings.TrimLeft(s, "0")
+}
+
+func buildGT06Ack(proto byte, serial []byte) []byte {
+	if len(serial) != 2 {
+		serial = []byte{0x00, 0x01}
+	}
+	ack := []byte{0x78, 0x78, 0x05, proto, serial[0], serial[1]}
+	crc := crcITU(ack[2:])
+	ack = append(ack, byte(crc>>8), byte(crc), 0x0D, 0x0A)
+	return ack
+}
+
+func crcITU(data []byte) uint16 {
+	var crc uint16 = 0xFFFF
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
 }
 
 // =====================================================
