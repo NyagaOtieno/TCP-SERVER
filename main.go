@@ -140,6 +140,12 @@ func handleConnection(conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	vLog("🔗 New connection from %s", remote)
 
+	// ✅ Helps with CGNAT/cellular proxies
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	imei, err := readIMEI(conn)
 	if err != nil {
 		vLog("❌ Failed IMEI read from %s: %v", remote, err)
@@ -202,110 +208,100 @@ func handleConnection(conn net.Conn) {
 			}
 
 			valid := []*AVLData{}
-for _, r := range records {
-    if r == nil {
-        continue
-    }
+			for _, r := range records {
+				if r == nil {
+					continue
+				}
 
-    // Skip zero coordinates
-    if r.Latitude == 0 || r.Longitude == 0 {
-        vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
-        continue
-    }
+				if r.Latitude == 0 || r.Longitude == 0 {
+					vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
+					continue
+				}
 
-    // Skip records without satellites
-    if r.Satellites == 0 {
-        vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
-        continue
-    }
+				if r.Satellites == 0 {
+					vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
+					continue
+				}
 
-    // Skip out-of-range coordinates
-    if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
-        vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
-        continue
-    }
+				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+					vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
+					continue
+				}
 
-    valid = append(valid, r)
+				valid = append(valid, r)
+			}
+
+			vLog("🔎 Parsed %d valid AVL records", len(valid))
+
+			if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+				vLog("❌ DB batch insert failed: %v", err)
+			}
+
+			payload := []map[string]interface{}{}
+			for _, r := range valid {
+				payload = append(payload, map[string]interface{}{
+					"device_id":  deviceID,
+					"imei":       imei,
+					"timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
+					"latitude":   r.Latitude,
+					"longitude":  r.Longitude,
+					"speed":      r.Speed,
+					"angle":      r.Angle,
+					"altitude":   r.Altitude,
+					"satellites": r.Satellites,
+					"io_data":    r.IOData,
+				})
+			}
+
+			_ = postPositionsToBackend(payload)
+			sendACK(conn, len(valid))
+
+			residual = residual[4+packetLen:]
+		}
+	}
 }
-
-vLog("🔎 Parsed %d valid AVL records", len(valid))
-
-if err := storePositionsBatch(deviceID, imei, valid); err != nil {
-    vLog("❌ DB batch insert failed: %v", err)
-}
-
-// Post to backend
-payload := []map[string]interface{}{}
-for _, r := range valid {
-    payload = append(payload, map[string]interface{}{
-        "device_id":  deviceID,
-        "imei":       imei,
-        "timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
-        "latitude":   r.Latitude,
-        "longitude":  r.Longitude,
-        "speed":      r.Speed,
-        "angle":      r.Angle,
-        "altitude":   r.Altitude,
-        "satellites": r.Satellites,
-        "io_data":    r.IOData,
-    })
-}
-
-_ = postPositionsToBackend(payload)
-sendACK(conn, len(valid))
-
- residual = residual[4+packetLen:]
-        } 
-    } 
-} 
 
 // =====================================================
 //                 IMEI / DEVICE HANDLING
 // =====================================================
 
 func readIMEI(conn net.Conn) (string, error) {
-	// Bigger buffer + longer deadline because cellular devices can be slow
+	// ✅ Retry window: keep waiting for IMEI bytes (GT06 or Teltonika)
+	deadline := time.Now().Add(2 * time.Minute)
+
 	buf := make([]byte, 4096)
-	conn.SetReadDeadline(time.Now().Add(45 * time.Second))
-	n, err := conn.Read(buf)
-	conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		return "", err
-	}
+	acc := make([]byte, 0, 8192)
 
-	raw := buf[:n]
-	vLog("🧾 IMEI-first-bytes (%d): %s", len(raw), strings.ToUpper(hex.EncodeToString(raw)))
-
-	// ----------------------------
-	// 1) GT06 / Uniguard / P13 style: 78 78 or 79 79
-	// ----------------------------
-	if len(raw) >= 5 && ((raw[0] == 0x78 && raw[1] == 0x78) || (raw[0] == 0x79 && raw[1] == 0x79)) {
-
-		// Try extract a full GT06 frame from the bytes we already got
-		frame, _, ok := extractGT06Frame(raw)
-		if !ok {
-			// We received partial frame; try read a bit more once
-			more := make([]byte, 2048)
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			m, e2 := conn.Read(more)
-			conn.SetReadDeadline(time.Time{})
-			if e2 == nil && m > 0 {
-				raw = append(raw, more[:m]...)
-				frame, _, ok = extractGT06Frame(raw)
+	for time.Now().Before(deadline) {
+		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		n, err := conn.Read(buf)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				vLog("⏱ waiting for IMEI... no bytes yet")
+				continue
 			}
+			return "", err
+		}
+		if n <= 0 {
+			continue
 		}
 
-		if ok {
-			proto := gt06Protocol(frame)
+		chunk := append([]byte(nil), buf[:n]...)
+		vLog("🧾 IMEI-read chunk (%d): %s", len(chunk), strings.ToUpper(hex.EncodeToString(chunk)))
+		acc = append(acc, chunk...)
 
-			// Login frame is usually proto 0x01
-			if proto == 0x01 {
+		// ----------------------------
+		// A) GT06 / P13 (78 78 / 79 79)
+		// ----------------------------
+		if len(acc) >= 2 && ((acc[0] == 0x78 && acc[1] == 0x78) || (acc[0] == 0x79 && acc[1] == 0x79)) {
+			frame, _, ok := extractGT06Frame(acc)
+			if ok && gt06Protocol(frame) == 0x01 {
 				imei := gt06ExtractIMEI(frame)
 				if imei == "" {
-					return "", fmt.Errorf("GT06 login detected but IMEI not parsed: %s", strings.ToUpper(hex.EncodeToString(frame)))
+					return "", fmt.Errorf("GT06 login received but IMEI not parsed: %s", strings.ToUpper(hex.EncodeToString(frame)))
 				}
 
-				// Send GT06 login ACK
 				serial := gt06ExtractSerial(frame)
 				ack := buildGT06Ack(0x01, serial)
 				_, _ = conn.Write(ack)
@@ -313,42 +309,58 @@ func readIMEI(conn net.Conn) (string, error) {
 				vLog("✅ GT06 IMEI parsed: %s | ACK: %s", imei, strings.ToUpper(hex.EncodeToString(ack)))
 				return imei, nil
 			}
-
-			// If device sent heartbeat first, ACK it and keep going
-			serial := gt06ExtractSerial(frame)
-			if serial != nil {
-				ack := buildGT06Ack(proto, serial)
-				_, _ = conn.Write(ack)
-				vLog("ℹ️ GT06 pre-login proto=0x%02X ACK sent: %s", proto, strings.ToUpper(hex.EncodeToString(ack)))
-			}
-
-			// We still need IMEI; read another packet
-			return "", fmt.Errorf("GT06 frame received but not login (proto=0x%02X); waiting for login", proto)
 		}
 
-		return "", fmt.Errorf("GT06 header detected but incomplete frame: %s", strings.ToUpper(hex.EncodeToString(raw)))
+		// ----------------------------
+		// B) Teltonika (00 0F + ASCII IMEI)
+		// ----------------------------
+		raw := acc
+		if len(raw) >= 2 && raw[0] == 0x00 && raw[1] == 0x0F {
+			raw = raw[2:]
+		}
+
+		re := regexp.MustCompile(`\D`)
+		imei := re.ReplaceAllString(string(raw), "")
+
+		if len(imei) >= 10 {
+			_, _ = conn.Write([]byte{0x01}) // Teltonika ACK
+			vLog("✅ Teltonika IMEI parsed: %s", imei)
+			return imei, nil
+		}
 	}
 
-	// ----------------------------
-	// 2) Teltonika style: 00 0F + ASCII IMEI
-	// ----------------------------
-	if len(raw) >= 2 && raw[0] == 0x00 && raw[1] == 0x0F {
-		raw = raw[2:]
-	}
-
-	re := regexp.MustCompile(`\D`)
-	imei := re.ReplaceAllString(string(raw), "")
-
-	if len(imei) < 10 {
-		return "", fmt.Errorf("could not parse Teltonika IMEI from: %s", strings.ToUpper(hex.EncodeToString(buf[:n])))
-	}
-
-	// Teltonika ACK
-	_, _ = conn.Write([]byte{0x01})
-	vLog("✅ Teltonika IMEI parsed: %s", imei)
-	return imei, nil
+	return "", fmt.Errorf("timeout waiting for IMEI (no parsable payload received)")
 }
 
+func ensureDevice(imei string) (int, error) {
+	var id int
+	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+
+	resp, err := httpClient.Get("https://mytrack-production.up.railway.app/api/devices/list")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var devices []Device
+	if err := json.Unmarshal(body, &devices); err != nil {
+		return 0, err
+	}
+
+	for _, d := range devices {
+		if strings.TrimSpace(d.IMEI) == imei {
+			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
+			return d.ID, nil
+		}
+	}
+
+	return 0, fmt.Errorf("device IMEI %s not found", imei)
+}
 
 // =====================================================
 //                 TELTONIKA CODEC PARSING
@@ -457,7 +469,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		return v
 	}
 
-	// 1-byte values
 	n1 := int(readByte())
 	for i := 0; i < n1; i++ {
 		id := readByte()
@@ -465,7 +476,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 2-byte values
 	n2 := int(readByte())
 	for i := 0; i < n2; i++ {
 		id := readByte()
@@ -473,7 +483,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 4-byte values
 	n4 := int(readByte())
 	for i := 0; i < n4; i++ {
 		id := readByte()
@@ -481,7 +490,6 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
-	// 8-byte values
 	n8 := int(readByte())
 	for i := 0; i < n8; i++ {
 		id := readByte()
@@ -576,8 +584,24 @@ func sendACK(conn net.Conn, count int) {
 	ack[4] = 0x01
 	_, _ = conn.Write(ack)
 }
+
+// =====================================================
+//                 UTILITY
+// =====================================================
+
+func getEnv(key, def string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return def
+	}
+	return val
+}
+
+// =====================================================
+//      GT06 / P13 HELPERS (ADDED, NONE REMOVED)
+// =====================================================
+
 func extractGT06Frame(buf []byte) (frame []byte, rest []byte, ok bool) {
-	// Find header 78 78 or 79 79
 	start := -1
 	for i := 0; i+1 < len(buf); i++ {
 		if (buf[i] == 0x78 && buf[i+1] == 0x78) || (buf[i] == 0x79 && buf[i+1] == 0x79) {
@@ -596,7 +620,6 @@ func extractGT06Frame(buf []byte) (frame []byte, rest []byte, ok bool) {
 		return nil, buf, false
 	}
 
-	// 78 78: length = 1 byte at [2], total = length + 5
 	if buf[0] == 0x78 && buf[1] == 0x78 {
 		l := int(buf[2])
 		total := l + 5
@@ -606,7 +629,6 @@ func extractGT06Frame(buf []byte) (frame []byte, rest []byte, ok bool) {
 		return buf[:total], buf[total:], true
 	}
 
-	// 79 79: length = 2 bytes at [2:4], total = length + 7
 	if buf[0] == 0x79 && buf[1] == 0x79 {
 		if len(buf) < 6 {
 			return nil, buf, false
@@ -647,7 +669,6 @@ func gt06ExtractIMEI(frame []byte) string {
 	if gt06Protocol(frame) != 0x01 {
 		return ""
 	}
-	// Typical: 8 bytes BCD after proto
 	if len(frame) >= 12 && frame[0] == 0x78 && frame[1] == 0x78 {
 		return decodeBCDIMEI(frame[4:12])
 	}
@@ -688,16 +709,4 @@ func crcITU(data []byte) uint16 {
 		}
 	}
 	return crc
-}
-
-// =====================================================
-//                 UTILITY
-// =====================================================
-
-func getEnv(key, def string) string {
-	val := os.Getenv(key)
-	if val == "" {
-		return def
-	}
-	return val
 }
