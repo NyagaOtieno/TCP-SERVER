@@ -221,19 +221,54 @@ func handleConnection(conn net.Conn) {
 }
 
 func detectProtocol(br *bufio.Reader) (Protocol, []byte, error) {
-	peek, err := br.Peek(32)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", nil, err
-	}
-	if len(peek) == 0 {
-		return "", nil, fmt.Errorf("no data")
+	deadline := time.Now().Add(60 * time.Second)
+	var peek []byte
+
+	for {
+		// If we already have some buffered data, inspect it.
+		if br.Buffered() > 0 {
+			n := min(32, br.Buffered())
+			p, _ := br.Peek(n)
+			if len(p) > 0 {
+				peek = p
+				break
+			}
+		}
+
+		// If no buffered data yet, block waiting for 1 byte.
+		if time.Now().After(deadline) {
+			return "", nil, fmt.Errorf("no data")
+		}
+
+		// Read one byte (blocks), then unread it so parsing still sees it.
+		b, err := br.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "", nil, fmt.Errorf("no data")
+			}
+			// keep waiting on temporary timeouts
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return "", nil, err
+		}
+		_ = br.UnreadByte()
+
+		// Now peek what we have.
+		p, _ := br.Peek(min(32, br.Buffered()))
+		if len(p) > 0 {
+			peek = p
+			break
+		}
 	}
 
-	// Teltonika IMEI handshake: 00 0F + ASCII digits
+	// ---- protocol detection using peek ----
+
+	// Teltonika IMEI handshake: 00 0F + digits
 	if len(peek) >= 2 && peek[0] == 0x00 && peek[1] == 0x0F {
 		return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
 	}
-	// Teltonika AVL frame: preamble 00 00 00 00
+	// Teltonika AVL preamble: 00 00 00 00
 	if len(peek) >= 4 && bytes.Equal(peek[:4], []byte{0, 0, 0, 0}) {
 		return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
 	}
@@ -243,14 +278,16 @@ func detectProtocol(br *bufio.Reader) (Protocol, []byte, error) {
 		return PROTO_GT06, peek[:min(32, len(peek))], nil
 	}
 
-	// UniGuard S168: ASCII with "S168#"
+	// UniGuard: ASCII starting with S168
 	trim := strings.TrimSpace(string(peek))
-	if strings.HasPrefix(strings.ReplaceAll(trim, " ", ""), "S168#") {
+	trim = strings.ReplaceAll(trim, " ", "")
+	if strings.HasPrefix(trim, "S168") {
 		return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
 	}
 
 	return "", peek[:min(32, len(peek))], fmt.Errorf("unknown starting bytes")
 }
+
 
 func sanitizeASCII(b []byte) string {
 	out := make([]byte, len(b))
