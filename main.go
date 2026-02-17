@@ -33,12 +33,12 @@ Protocols supported:
 
 2) GT06 family:
    Frame: 0x7878 (or 0x7979) + length + protocol + info + serial(2) + crc(2) + 0D0A
-   CRC is CRC-ITU/X25: init 0xFFFF, reflect in/out, xorout 0xFFFF (aka "~fcs" in their sample) :contentReference[oaicite:3]{index=3}
-   ACK: 7878 05 <protocol> <serial(2)> <crc(2)> 0D0A (matches sample) :contentReference[oaicite:4]{index=4}
+   CRC is CRC-ITU/X25: init 0xFFFF, reflect in/out, xorout 0xFFFF (aka "~fcs" in their sample) 3
+   ACK: 7878 05 <protocol> <serial(2)> <crc(2)> 0D0A (matches sample) 4
 
 3) UniGuard S168:
    ASCII ending with '$'
-   Example upstream LOCA / SYNC and downstream ACK formats :contentReference[oaicite:5]{index=5} :contentReference[oaicite:6]{index=6}
+   Example upstream LOCA / SYNC and downstream ACK formats 5 6
 */
 
 type AVLData struct {
@@ -72,7 +72,7 @@ var (
 
 func vLog(format string, a ...interface{}) {
 	if verbose {
-		log.Printf(format, a...)
+	log.Printf(format, a...)
 	}
 }
 
@@ -87,13 +87,13 @@ func init() {
 
 	pgURL := getEnv("DATABASE_URL", "")
 	if pgURL == "" {
-		log.Fatal("❌ DATABASE_URL not set")
+	log.Fatal("❌ DATABASE_URL not set")
 	}
 
 	var err error
 	db, err = sql.Open("postgres", pgURL)
 	if err != nil {
-		log.Fatalf("❌ Failed to open PostgreSQL connection: %v", err)
+	log.Fatalf("❌ Failed to open PostgreSQL connection: %v", err)
 	}
 
 	db.SetMaxOpenConns(20)
@@ -101,23 +101,23 @@ func init() {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err = db.Ping(); err != nil {
-		log.Fatalf("❌ PostgreSQL ping failed: %v", err)
+	log.Fatalf("❌ PostgreSQL ping failed: %v", err)
 	}
 	vLog("✅ PostgreSQL connected successfully")
 
 	positionsHasIoData = checkPositionsHasIoData()
 	if positionsHasIoData {
-		vLog("ℹ️ positions.io_data column detected; will store IO JSON")
+	vLog("ℹ️ positions.io_data column detected; will store IO JSON")
 	} else {
-		vLog("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
+	vLog("⚠️ positions.io_data column not detected; IO data will be omitted from DB inserts")
 	}
 }
 
 func checkPositionsHasIoData() bool {
 	var col string
 	err := db.QueryRow(`
-		SELECT column_name FROM information_schema.columns 
-		WHERE table_name='positions' AND column_name='io_data' LIMIT 1
+	SELECT column_name FROM information_schema.columns 
+	WHERE table_name='positions' AND column_name='io_data' LIMIT 1
 	`).Scan(&col)
 	return err == nil && col == "io_data"
 }
@@ -127,27 +127,27 @@ func main() {
 
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
-		log.Fatalf("❌ Failed to start TCP server: %v", err)
+	log.Fatalf("❌ Failed to start TCP server: %v", err)
 	}
 	defer listener.Close()
 
 	vLog("✅ TCP Server listening on %s", tcpServerHost)
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			vLog("⚠️ Accept error: %v", err)
-			continue
-		}
-		wg.Add(1)
-		go func(c net.Conn) {
-			defer func() {
-				if r := recover(); r != nil {
-					vLog("🔥 Panic recovered: %v", r)
-				}
-			}()
-			handleConnection(c)
-		}(conn)
+	conn, err := listener.Accept()
+	if err != nil {
+	vLog("⚠️ Accept error: %v", err)
+	continue
+	}
+	wg.Add(1)
+	go func(c net.Conn) {
+	defer func() {
+	if r := recover(); r != nil {
+	vLog("🔥 Panic recovered: %v", r)
+	}
+	}()
+	handleConnection(c)
+	}(conn)
 	}
 }
 
@@ -178,62 +178,62 @@ func handleConnection(conn net.Conn) {
 	proto, first, err := detectProtocol(br)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		vLog("⚠️ Protocol detect failed from %s: %v", remote, err)
-		return
+	vLog("⚠️ Protocol detect failed from %s: %v", remote, err)
+	return
 	}
 
 	vLog("🧭 Protocol from %s: %s", remote, proto)
 	if len(first) > 0 {
-		vLog("👀 First bytes HEX (%d): %s", len(first), hex.EncodeToString(first))
-		vLog("👀 First bytes ASCII: %q", sanitizeASCII(first))
+	vLog("👀 First bytes HEX (%d): %s", len(first), hex.EncodeToString(first))
+	vLog("👀 First bytes ASCII: %q", sanitizeASCII(first))
 	}
 
 	switch proto {
 	case PROTO_TELTONIKA:
-		handleTeltonika(conn, br)
+	handleTeltonika(conn, br)
 	case PROTO_GT06:
-		handleGT06(conn, br)
+	handleGT06(conn, br)
 	case PROTO_UNIGUARD:
-		handleUniGuard(conn, br)
+	handleUniGuard(conn, br)
 	default:
-		vLog("⚠️ Unknown protocol from %s", remote)
+	vLog("⚠️ Unknown protocol from %s", remote)
 	}
 }
 
 func detectProtocol(br *bufio.Reader) (Protocol, []byte, error) {
 	peek, err := br.Peek(32)
 	if err != nil && !errors.Is(err, io.EOF) {
-		// If nothing available yet, still return a meaningful error.
-		return "", nil, err
+	// If nothing available yet, still return a meaningful error.
+	return "", nil, err
 	}
 	if len(peek) == 0 {
-		return "", nil, fmt.Errorf("no data")
+	return "", nil, fmt.Errorf("no data")
 	}
 
 	// Teltonika IMEI handshake: 00 0F + 15 ASCII digits
 	if len(peek) >= 2 && peek[0] == 0x00 && peek[1] == 0x0F {
-		return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
+	return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
 	}
 
 	// Teltonika AVL frame can also start with preamble 00 00 00 00
 	if len(peek) >= 4 && bytes.Equal(peek[:4], []byte{0x00, 0x00, 0x00, 0x00}) {
-		return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
+	return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
 	}
 
 	// GT06 frame: 78 78 or 79 79
 	if len(peek) >= 2 && ((peek[0] == 0x78 && peek[1] == 0x78) || (peek[0] == 0x79 && peek[1] == 0x79)) {
-		return PROTO_GT06, peek[:min(32, len(peek))], nil
+	return PROTO_GT06, peek[:min(32, len(peek))], nil
 	}
 
 	// UniGuard: ASCII starting with "S168" (spaces sometimes appear, but usually "S168#")
 	trim := strings.TrimSpace(string(peek))
 	if strings.HasPrefix(trim, "S168") {
-		return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
+	return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
 	}
 
 	// Fallback: if it's printable ASCII and contains "#", likely UniGuard
 	if isMostlyASCII(peek) && bytes.Contains(peek, []byte("#")) && bytes.Contains(peek, []byte("S168")) {
-		return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
+	return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
 	}
 
 	return "", peek[:min(32, len(peek))], fmt.Errorf("unknown starting bytes")
@@ -242,24 +242,24 @@ func detectProtocol(br *bufio.Reader) (Protocol, []byte, error) {
 func sanitizeASCII(b []byte) string {
 	out := make([]byte, len(b))
 	for i := range b {
-		if b[i] >= 32 && b[i] <= 126 {
-			out[i] = b[i]
-		} else {
-			out[i] = '.'
-		}
+	if b[i] >= 32 && b[i] <= 126 {
+	out[i] = b[i]
+	} else {
+	out[i] = '.'
+	}
 	}
 	return string(out)
 }
 
 func isMostlyASCII(b []byte) bool {
 	if len(b) == 0 {
-		return false
+	return false
 	}
 	printable := 0
 	for _, c := range b {
-		if c == '\r' || c == '\n' || c == '\t' || (c >= 32 && c <= 126) {
-			printable++
-		}
+	if c == '\r' || c == '\n' || c == '\t' || (c >= 32 && c <= 126) {
+	printable++
+	}
 	}
 	return float64(printable)/float64(len(b)) > 0.8
 }
@@ -271,33 +271,33 @@ func isMostlyASCII(b []byte) bool {
 func ensureDevice(imei string) (int, error) {
 	imei = strings.TrimSpace(imei)
 	if imei == "" {
-		return 0, fmt.Errorf("empty imei")
+	return 0, fmt.Errorf("empty imei")
 	}
 
 	var id int
 	err := db.QueryRow("SELECT id FROM devices WHERE imei=$1", imei).Scan(&id)
 	if err == nil {
-		return id, nil
+	return id, nil
 	}
 
 	// Fetch devices list from your backend
 	resp, err := httpClient.Get(devicesListURL)
 	if err != nil {
-		return 0, err
+	return 0, err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	var devices []Device
 	if err := json.Unmarshal(body, &devices); err != nil {
-		return 0, err
+	return 0, err
 	}
 
 	for _, d := range devices {
-		if strings.TrimSpace(d.IMEI) == imei {
-			_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
-			return d.ID, nil
-		}
+	if strings.TrimSpace(d.IMEI) == imei {
+	_, _ = db.Exec("INSERT INTO devices(id, imei) VALUES($1,$2) ON CONFLICT DO NOTHING", d.ID, d.IMEI)
+	return d.ID, nil
+	}
 	}
 
 	return 0, fmt.Errorf("device IMEI %s not found", imei)
@@ -312,53 +312,53 @@ func handleTeltonika(conn net.Conn, br *bufio.Reader) {
 
 	imei, err := teltonikaReadIMEI(conn, br)
 	if err != nil {
-		vLog("❌ Failed IMEI read (Teltonika) from %s: %v", remote, err)
-		return
+	vLog("❌ Failed IMEI read (Teltonika) from %s: %v", remote, err)
+	return
 	}
 	vLog("📡 Teltonika device connected: %s", imei)
 
 	deviceID, err := ensureDevice(imei)
 	if err != nil {
-		vLog("❌ Device lookup failed for IMEI %s: %v", imei, err)
-		return
+	vLog("❌ Device lookup failed for IMEI %s: %v", imei, err)
+	return
 	}
 
 	// Read Teltonika AVL frames continuously
 	for {
-		// Some devices keep connection long; set a long read deadline.
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	// Some devices keep connection long; set a long read deadline.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
-		frame, err := teltonikaReadFrame(br)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				vLog("⏱ Teltonika read timeout for %s, closing", imei)
-			} else if !errors.Is(err, io.EOF) {
-				vLog("🔌 Teltonika read error for %s: %v", imei, err)
-			}
-			return
-		}
+	frame, err := teltonikaReadFrame(br)
+	if err != nil {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+	vLog("⏱ Teltonika read timeout for %s, closing", imei)
+	} else if !errors.Is(err, io.EOF) {
+	vLog("🔌 Teltonika read error for %s: %v", imei, err)
+	}
+	return
+	}
 
-		records, err := teltonikaParseAVL(frame)
-		if err != nil {
-			vLog("❌ Teltonika AVL parse error (imei=%s): %v", imei, err)
-			// ACK 0 records to be safe
-			_ = teltonikaSendAck(conn, 0)
-			continue
-		}
+	records, err := teltonikaParseAVL(frame)
+	if err != nil {
+	vLog("❌ Teltonika AVL parse error (imei=%s): %v", imei, err)
+	// ACK 0 records to be safe
+	_ = teltonikaSendAck(conn, 0)
+	continue
+	}
 
-		valid := filterValid(records, imei)
+	valid := filterValid(records, imei)
 
-		vLog("🔎 Teltonika parsed %d valid records (raw=%d)", len(valid), len(records))
+	vLog("🔎 Teltonika parsed %d valid records (raw=%d)", len(valid), len(records))
 
-		if err := storePositionsBatch(deviceID, imei, valid); err != nil {
-			vLog("❌ DB insert failed (Teltonika): %v", err)
-		}
+	if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+	vLog("❌ DB insert failed (Teltonika): %v", err)
+	}
 
-		payload := buildBackendPayload(deviceID, imei, valid)
-		_ = postPositionsToBackend(payload)
+	payload := buildBackendPayload(deviceID, imei, valid)
+	_ = postPositionsToBackend(payload)
 
-		// ACK = number of accepted records (4 bytes)
-		_ = teltonikaSendAck(conn, len(valid))
+	// ACK = number of accepted records (4 bytes)
+	_ = teltonikaSendAck(conn, len(valid))
 	}
 }
 
@@ -370,22 +370,22 @@ func teltonikaReadIMEI(conn net.Conn, br *bufio.Reader) (string, error) {
 	// Read first 2 bytes
 	h := make([]byte, 2)
 	if _, err := io.ReadFull(br, h); err != nil {
-		return "", err
+	return "", err
 	}
 
 	imeiLen := int(binary.BigEndian.Uint16(h))
 	if imeiLen <= 0 || imeiLen > 32 {
-		return "", fmt.Errorf("invalid imei length: %d", imeiLen)
+	return "", fmt.Errorf("invalid imei length: %d", imeiLen)
 	}
 
 	imeiBytes := make([]byte, imeiLen)
 	if _, err := io.ReadFull(br, imeiBytes); err != nil {
-		return "", err
+	return "", err
 	}
 
 	imei := regexp.MustCompile(`\D`).ReplaceAllString(string(imeiBytes), "")
 	if imei == "" {
-		return "", fmt.Errorf("empty imei after sanitize")
+	return "", fmt.Errorf("empty imei after sanitize")
 	}
 
 	// Teltonika expects 0x01 (1 byte) as accept
@@ -397,22 +397,22 @@ func teltonikaReadFrame(br *bufio.Reader) ([]byte, error) {
 	// Frame: preamble(4=0) + dataLen(4) + data(dataLen) + crc(4)
 	header := make([]byte, 8)
 	if _, err := io.ReadFull(br, header); err != nil {
-		return nil, err
+	return nil, err
 	}
 	if !bytes.Equal(header[:4], []byte{0, 0, 0, 0}) {
-		// Some devices may start directly with dataLen; try to recover by treating first 4 as dataLen.
-		// Put back? We can't un-read, so fail loudly.
-		return nil, fmt.Errorf("unexpected preamble: %s", hex.EncodeToString(header[:4]))
+	// Some devices may start directly with dataLen; try to recover by treating first 4 as dataLen.
+	// Put back? We can't un-read, so fail loudly.
+	return nil, fmt.Errorf("unexpected preamble: %s", hex.EncodeToString(header[:4]))
 	}
 
 	dataLen := int(binary.BigEndian.Uint32(header[4:8]))
 	if dataLen <= 0 || dataLen > 8*1024*1024 {
-		return nil, fmt.Errorf("invalid dataLen: %d", dataLen)
+	return nil, fmt.Errorf("invalid dataLen: %d", dataLen)
 	}
 
 	data := make([]byte, dataLen+4) // include CRC at end
 	if _, err := io.ReadFull(br, data); err != nil {
-		return nil, err
+	return nil, err
 	}
 
 	frame := data[:dataLen] // ignore CRC(4) for now
@@ -422,11 +422,11 @@ func teltonikaReadFrame(br *bufio.Reader) ([]byte, error) {
 func teltonikaParseAVL(data []byte) ([]*AVLData, error) {
 	// data starts with codec id (0x08 or 0x8E), then count, then records, then count2
 	if len(data) < 3 {
-		return nil, fmt.Errorf("frame too short")
+	return nil, fmt.Errorf("frame too short")
 	}
 	codec := data[0]
 	if codec != 0x08 && codec != 0x8E {
-		return nil, fmt.Errorf("unsupported codec: 0x%X", codec)
+	return nil, fmt.Errorf("unsupported codec: 0x%X", codec)
 	}
 	r := bytes.NewReader(data)
 
@@ -435,12 +435,12 @@ func teltonikaParseAVL(data []byte) ([]*AVLData, error) {
 
 	records := make([]*AVLData, 0, count)
 	for i := 0; i < count; i++ {
-		rec, err := teltonikaParseRecord(r, codec)
-		if err != nil {
-			// stop if stream desync
-			return records, err
-		}
-		records = append(records, rec)
+	rec, err := teltonikaParseRecord(r, codec)
+	if err != nil {
+	// stop if stream desync
+	return records, err
+	}
+	records = append(records, rec)
 	}
 
 	// trailing count2
@@ -462,80 +462,80 @@ func teltonikaParseRecord(r *bytes.Reader, codec byte) (*AVLData, error) {
 
 	io := map[string]interface{}{}
 	if codec == 0x08 {
-		// Event IO ID (1), Total IO (1)
-		eventIO := readU8(r)
-		totalIO := readU8(r)
-		io["event_io_id"] = eventIO
-		io["total_io"] = totalIO
+	// Event IO ID (1), Total IO (1)
+	eventIO := readU8(r)
+	totalIO := readU8(r)
+	io["event_io_id"] = eventIO
+	io["total_io"] = totalIO
 
-		// n1, n2, n4, n8 (all 1-byte)
-		n1 := int(readU8(r))
-		for i := 0; i < n1; i++ {
-			id := readU8(r)
-			val := readU8(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
-		n2 := int(readU8(r))
-		for i := 0; i < n2; i++ {
-			id := readU8(r)
-			val := readU16(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
-		n4 := int(readU8(r))
-		for i := 0; i < n4; i++ {
-			id := readU8(r)
-			val := readU32(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
-		n8 := int(readU8(r))
-		for i := 0; i < n8; i++ {
-			id := readU8(r)
-			val := readU64(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
+	// n1, n2, n4, n8 (all 1-byte)
+	n1 := int(readU8(r))
+	for i := 0; i < n1; i++ {
+	id := readU8(r)
+	val := readU8(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
+	n2 := int(readU8(r))
+	for i := 0; i < n2; i++ {
+	id := readU8(r)
+	val := readU16(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
+	n4 := int(readU8(r))
+	for i := 0; i < n4; i++ {
+	id := readU8(r)
+	val := readU32(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
+	n8 := int(readU8(r))
+	for i := 0; i < n8; i++ {
+	id := readU8(r)
+	val := readU64(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
 	} else {
-		// codec 0x8E: IDs & counts are 2 bytes
-		eventIO := readU16(r)
-		totalIO := readU16(r)
-		io["event_io_id"] = eventIO
-		io["total_io"] = totalIO
+	// codec 0x8E: IDs & counts are 2 bytes
+	eventIO := readU16(r)
+	totalIO := readU16(r)
+	io["event_io_id"] = eventIO
+	io["total_io"] = totalIO
 
-		n1 := int(readU16(r))
-		for i := 0; i < n1; i++ {
-			id := readU16(r)
-			val := readU8(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
-		n2 := int(readU16(r))
-		for i := 0; i < n2; i++ {
-			id := readU16(r)
-			val := readU16(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
-		n4 := int(readU16(r))
-		for i := 0; i < n4; i++ {
-			id := readU16(r)
-			val := readU32(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
-		n8 := int(readU16(r))
-		for i := 0; i < n8; i++ {
-			id := readU16(r)
-			val := readU64(r)
-			io[fmt.Sprintf("io_%d", id)] = val
-		}
+	n1 := int(readU16(r))
+	for i := 0; i < n1; i++ {
+	id := readU16(r)
+	val := readU8(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
+	n2 := int(readU16(r))
+	for i := 0; i < n2; i++ {
+	id := readU16(r)
+	val := readU16(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
+	n4 := int(readU16(r))
+	for i := 0; i < n4; i++ {
+	id := readU16(r)
+	val := readU32(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
+	n8 := int(readU16(r))
+	for i := 0; i < n8; i++ {
+	id := readU16(r)
+	val := readU64(r)
+	io[fmt.Sprintf("io_%d", id)] = val
+	}
 	}
 
 	return &AVLData{
-		Timestamp:  time.UnixMilli(ts).UTC(),
-		Latitude:   float64(lat) / 1e7,
-		Longitude:  float64(lon) / 1e7,
-		Altitude:   alt,
-		Angle:      angle,
-		Satellites: sats,
-		Speed:      speed,
-		IOData:     io,
-		Source:     "TELTONIKA",
+	Timestamp:  time.UnixMilli(ts).UTC(),
+	Latitude:   float64(lat) / 1e7,
+	Longitude:  float64(lon) / 1e7,
+	Altitude:   alt,
+	Angle:      angle,
+	Satellites: sats,
+	Speed:      speed,
+	IOData:     io,
+	Source:     "TELTONIKA",
 	}, nil
 }
 
@@ -557,46 +557,46 @@ func handleGT06(conn net.Conn, br *bufio.Reader) {
 	var deviceID int
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		pkt, err := gt06ReadPacket(br)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				vLog("⏱ GT06 read timeout (%s), closing", remote)
-			} else if !errors.Is(err, io.EOF) {
-				vLog("🔌 GT06 read error (%s): %v", remote, err)
-			}
-			return
-		}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	pkt, err := gt06ReadPacket(br)
+	if err != nil {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+	vLog("⏱ GT06 read timeout (%s), closing", remote)
+	} else if !errors.Is(err, io.EOF) {
+	vLog("🔌 GT06 read error (%s): %v", remote, err)
+	}
+	return
+	}
 
-		info, err := gt06ParsePacket(pkt)
-		if err != nil {
-			vLog("❌ GT06 parse error: %v", err)
-			continue
-		}
+	info, err := gt06ParsePacket(pkt)
+	if err != nil {
+	vLog("❌ GT06 parse error: %v", err)
+	continue
+	}
 
-		// Login gives us IMEI
-		if info.IMEI != "" && imei == "" {
-			imei = info.IMEI
-			vLog("📡 GT06 device connected: %s", imei)
-			deviceID, err = ensureDevice(imei)
-			if err != nil {
-				vLog("❌ Device lookup failed for GT06 IMEI %s: %v", imei, err)
-				return
-			}
-		}
+	// Login gives us IMEI
+	if info.IMEI != "" && imei == "" {
+	imei = info.IMEI
+	vLog("📡 GT06 device connected: %s", imei)
+	deviceID, err = ensureDevice(imei)
+	if err != nil {
+	vLog("❌ Device lookup failed for GT06 IMEI %s: %v", imei, err)
+	return
+	}
+	}
 
-		// ACK every packet (per protocol examples) :contentReference[oaicite:7]{index=7}
-		_ = gt06SendAck(conn, info.Protocol, info.Serial)
+	// ACK every packet (per protocol examples) 7
+	_ = gt06SendAck(conn, info.Protocol, info.Serial)
 
-		// If we got position data, store/post
-		if info.Position != nil && imei != "" {
-			valid := filterValid([]*AVLData{info.Position}, imei)
-			if err := storePositionsBatch(deviceID, imei, valid); err != nil {
-				vLog("❌ DB insert failed (GT06): %v", err)
-			}
-			payload := buildBackendPayload(deviceID, imei, valid)
-			_ = postPositionsToBackend(payload)
-		}
+	// If we got position data, store/post
+	if info.Position != nil && imei != "" {
+	valid := filterValid([]*AVLData{info.Position}, imei)
+	if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+	vLog("❌ DB insert failed (GT06): %v", err)
+	}
+	payload := buildBackendPayload(deviceID, imei, valid)
+	_ = postPositionsToBackend(payload)
+	}
 	}
 }
 
@@ -611,19 +611,19 @@ func gt06ReadPacket(br *bufio.Reader) ([]byte, error) {
 	// Start can be 7878 or 7979
 	start, err := br.Peek(2)
 	if err != nil {
-		return nil, err
+	return nil, err
 	}
 	if !((start[0] == 0x78 && start[1] == 0x78) || (start[0] == 0x79 && start[1] == 0x79)) {
-		// consume one byte and retry to resync
-		_, _ = br.ReadByte()
-		return nil, fmt.Errorf("gt06 resync: invalid start %s", hex.EncodeToString(start))
+	// consume one byte and retry to resync
+	_, _ = br.ReadByte()
+	return nil, fmt.Errorf("gt06 resync: invalid start %s", hex.EncodeToString(start))
 	}
 
 	// For 7878 format:
 	// totalLen = (PacketLen byte) + 5 (start2 + len1 + stop2)
 	hdr := make([]byte, 3)
 	if _, err := io.ReadFull(br, hdr); err != nil {
-		return nil, err
+	return nil, err
 	}
 	pLen := int(hdr[2])
 
@@ -631,28 +631,28 @@ func gt06ReadPacket(br *bufio.Reader) ([]byte, error) {
 	pkt := make([]byte, total)
 	copy(pkt[:3], hdr)
 	if _, err := io.ReadFull(br, pkt[3:]); err != nil {
-		return nil, err
+	return nil, err
 	}
 
 	// Expect stop 0D0A
 	if len(pkt) >= 2 && !(pkt[len(pkt)-2] == 0x0D && pkt[len(pkt)-1] == 0x0A) {
-		return pkt, fmt.Errorf("gt06 stop bits missing")
+	return pkt, fmt.Errorf("gt06 stop bits missing")
 	}
 	return pkt, nil
 }
 
 func gt06ParsePacket(pkt []byte) (*gt06Info, error) {
 	if len(pkt) < 10 {
-		return nil, fmt.Errorf("packet too short")
+	return nil, fmt.Errorf("packet too short")
 	}
 	startOK := (pkt[0] == 0x78 && pkt[1] == 0x78) || (pkt[0] == 0x79 && pkt[1] == 0x79)
 	if !startOK {
-		return nil, fmt.Errorf("bad start bits")
+	return nil, fmt.Errorf("bad start bits")
 	}
 
 	pLen := int(pkt[2])
 	if pLen+5 != len(pkt) {
-		// tolerate mismatch
+	// tolerate mismatch
 	}
 
 	proto := pkt[3]
@@ -666,7 +666,7 @@ func gt06ParsePacket(pkt []byte) (*gt06Info, error) {
 	crcCalc := crc16X25(pkt[crcStart:crcEnd])
 	crcGot := binary.BigEndian.Uint16(pkt[len(pkt)-4 : len(pkt)-2])
 	if crcCalc != crcGot {
-		return nil, fmt.Errorf("crc mismatch: got=0x%04X calc=0x%04X", crcGot, crcCalc)
+	return nil, fmt.Errorf("crc mismatch: got=0x%04X calc=0x%04X", crcGot, crcCalc)
 	}
 
 	serial := binary.BigEndian.Uint16(pkt[len(pkt)-6 : len(pkt)-4])
@@ -678,21 +678,21 @@ func gt06ParsePacket(pkt []byte) (*gt06Info, error) {
 
 	switch proto {
 	case 0x01: // login
-		// login content: 8 bytes terminal id; IMEI is BCD-like (15 digits)
-		if len(infoPayload) >= 8 {
-			info.IMEI = gt06DecodeIMEI(infoPayload[:8])
-		}
+	// login content: 8 bytes terminal id; IMEI is BCD-like (15 digits)
+	if len(infoPayload) >= 8 {
+	info.IMEI = gt06DecodeIMEI(infoPayload[:8])
+	}
 	case 0x12, 0x16: // GPS data packets
-		pos, err := gt06ParseGPS(proto, infoPayload)
-		if err == nil && pos != nil {
-			pos.Source = "GT06"
-			info.Position = pos
-		}
-		// else ignore
+	pos, err := gt06ParseGPS(proto, infoPayload)
+	if err == nil && pos != nil {
+	pos.Source = "GT06"
+	info.Position = pos
+	}
+	// else ignore
 	case 0x13:
-		// heartbeat/status packet — no position; still ACK :contentReference[oaicite:8]{index=8}
+	// heartbeat/status packet — no position; still ACK 8
 	default:
-		// other protocols supported by ACK only
+	// other protocols supported by ACK only
 	}
 
 	return info, nil
@@ -721,13 +721,13 @@ func gt06DecodeIMEI(b []byte) string {
 	// Usually 8 bytes BCD: each nibble is a digit; first nibble may be 0
 	digits := make([]byte, 0, 16)
 	for _, by := range b {
-		hi := (by >> 4) & 0x0F
-		lo := by & 0x0F
-		digits = append(digits, '0'+hi, '0'+lo)
+	hi := (by >> 4) & 0x0F
+	lo := by & 0x0F
+	digits = append(digits, '0'+hi, '0'+lo)
 	}
 	imei := strings.TrimLeft(string(digits), "0")
 	if len(imei) > 15 {
-		imei = imei[len(imei)-15:]
+	imei = imei[len(imei)-15:]
 	}
 	return imei
 }
@@ -735,9 +735,9 @@ func gt06DecodeIMEI(b []byte) string {
 func gt06ParseGPS(proto byte, p []byte) (*AVLData, error) {
 	// Common GT06 combined GPS+LBS contains:
 	// DateTime(6) + GPSInfo(1) + Lat(4) + Lon(4) + Speed(1) + CourseStatus(2) + ...
-	// Example layout in document :contentReference[oaicite:9]{index=9}
+	// Example layout in document 9
 	if len(p) < 6+1+4+4+1+2 {
-		return nil, fmt.Errorf("gps payload too short")
+	return nil, fmt.Errorf("gps payload too short")
 	}
 
 	yy := int(p[0])
@@ -766,33 +766,33 @@ func gt06ParseGPS(proto byte, p []byte) (*AVLData, error) {
 	// bit12: West (1=west)
 	// course = low 10 bits
 	if (courseStatus & (1 << 11)) != 0 {
-		lat = -lat
+	lat = -lat
 	}
 	if (courseStatus & (1 << 12)) != 0 {
-		lon = -lon
+	lon = -lon
 	}
 	angle := int(courseStatus & 0x03FF)
 
 	return &AVLData{
-		Timestamp:  ts,
-		Latitude:   lat,
-		Longitude:  lon,
-		Altitude:   0,
-		Angle:      angle,
-		Satellites: sats,
-		Speed:      speed,
-		IOData: map[string]interface{}{
-			"proto": fmt.Sprintf("0x%02X", proto),
-		},
-		Source: "GT06",
+	Timestamp:  ts,
+	Latitude:   lat,
+	Longitude:  lon,
+	Altitude:   0,
+	Angle:      angle,
+	Satellites: sats,
+	Speed:      speed,
+	IOData: map[string]interface{}{
+	"proto": fmt.Sprintf("0x%02X", proto),
+	},
+	Source: "GT06",
 	}, nil
 }
 
-// CRC-ITU/X25 as per their sample implementation: init 0xFFFF, table-based, return ~fcs :contentReference[oaicite:10]{index=10}
+// CRC-ITU/X25 as per their sample implementation: init 0xFFFF, table-based, return ~fcs 10
 func crc16X25(data []byte) uint16 {
 	var fcs uint16 = 0xFFFF
 	for _, b := range data {
-		fcs = (fcs >> 8) ^ crctab16[(fcs^uint16(b))&0xFF]
+	fcs = (fcs >> 8) ^ crctab16[(fcs^uint16(b))&0xFF]
 	}
 	return ^fcs
 }
@@ -843,77 +843,77 @@ func handleUniGuard(conn net.Conn, br *bufio.Reader) {
 	var deviceID int
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
-		line, err := uniReadFrame(br)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				vLog("⏱ UniGuard read timeout (%s), closing", remote)
-			} else if !errors.Is(err, io.EOF) {
-				vLog("🔌 UniGuard read error (%s): %v", remote, err)
-			}
-			return
-		}
+	line, err := uniReadFrame(br)
+	if err != nil {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+	vLog("⏱ UniGuard read timeout (%s), closing", remote)
+	} else if !errors.Is(err, io.EOF) {
+	vLog("🔌 UniGuard read error (%s): %v", remote, err)
+	}
+	return
+	}
 
-		msg := strings.TrimSpace(line)
-		if msg == "" {
-			continue
-		}
+	msg := strings.TrimSpace(line)
+	if msg == "" {
+	continue
+	}
 
-		parsed, err := uniParse(msg)
-		if err != nil {
-			vLog("❌ UniGuard parse error: %v (msg=%q)", err, msg)
-			continue
-		}
+	parsed, err := uniParse(msg)
+	if err != nil {
+	vLog("❌ UniGuard parse error: %v (msg=%q)", err, msg)
+	continue
+	}
 
-		if parsed.IMEI != "" && imei == "" {
-			imei = parsed.IMEI
-			vLog("📡 UniGuard device connected: %s", imei)
-			deviceID, err = ensureDevice(imei)
-			if err != nil {
-				vLog("❌ Device lookup failed for UniGuard IMEI %s: %v", imei, err)
-				return
-			}
-		}
+	if parsed.IMEI != "" && imei == "" {
+	imei = parsed.IMEI
+	vLog("📡 UniGuard device connected: %s", imei)
+	deviceID, err = ensureDevice(imei)
+	if err != nil {
+	vLog("❌ Device lookup failed for UniGuard IMEI %s: %v", imei, err)
+	return
+	}
+	}
 
-		// ACK rules:
-		// - LOCA: downstream ACK ^ LOCA :contentReference[oaicite:11]{index=11}
-		// - SYNC: downstream ACK ^ SYNC, utc time (yyyymmddhhmmss) :contentReference[oaicite:12]{index=12}
-		if parsed.Type == "LOCA" {
-			_ = uniSendAck(conn, parsed.Serial, "LOCA", "")
-		} else if parsed.Type == "SYNC" {
-			nowUTC := time.Now().UTC().Format("20060102150405")
-			_ = uniSendAck(conn, parsed.Serial, "SYNC", nowUTC)
-		}
+	// ACK rules:
+	// - LOCA: downstream ACK ^ LOCA 11
+	// - SYNC: downstream ACK ^ SYNC, utc time (yyyymmddhhmmss) 12
+	if parsed.Type == "LOCA" {
+	_ = uniSendAck(conn, parsed.Serial, "LOCA", "")
+	} else if parsed.Type == "SYNC" {
+	nowUTC := time.Now().UTC().Format("20060102150405")
+	_ = uniSendAck(conn, parsed.Serial, "SYNC", nowUTC)
+	}
 
-		// store/post if has position
-		if parsed.Position != nil && imei != "" {
-			valid := filterValid([]*AVLData{parsed.Position}, imei)
-			if err := storePositionsBatch(deviceID, imei, valid); err != nil {
-				vLog("❌ DB insert failed (UniGuard): %v", err)
-			}
-			payload := buildBackendPayload(deviceID, imei, valid)
-			_ = postPositionsToBackend(payload)
-		}
+	// store/post if has position
+	if parsed.Position != nil && imei != "" {
+	valid := filterValid([]*AVLData{parsed.Position}, imei)
+	if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+	vLog("❌ DB insert failed (UniGuard): %v", err)
+	}
+	payload := buildBackendPayload(deviceID, imei, valid)
+	_ = postPositionsToBackend(payload)
+	}
 	}
 }
 
 func uniReadFrame(br *bufio.Reader) (string, error) {
-	// UniGuard frames end with '$' :contentReference[oaicite:13]{index=13}
+	// UniGuard frames end with '$' 13
 	var buf bytes.Buffer
 	for {
-		b, err := br.ReadByte()
-		if err != nil {
-			return "", err
-		}
-		buf.WriteByte(b)
-		if b == '$' {
-			return buf.String(), nil
-		}
-		// safety guard
-		if buf.Len() > 64*1024 {
-			return "", fmt.Errorf("uniguard frame too large")
-		}
+	b, err := br.ReadByte()
+	if err != nil {
+	return "", err
+	}
+	buf.WriteByte(b)
+	if b == '$' {
+	return buf.String(), nil
+	}
+	// safety guard
+	if buf.Len() > 64*1024 {
+	return "", fmt.Errorf("uniguard frame too large")
+	}
 	}
 }
 
@@ -927,20 +927,20 @@ type uniMsg struct {
 
 func uniParse(msg string) (*uniMsg, error) {
 	// Format like:
-	// S168#<imei>#<serial>#<len>#LOCA: ... $ :contentReference[oaicite:14]{index=14}
-	// or heartbeat SYNC... :contentReference[oaicite:15]{index=15}
+	// S168#<imei>#<serial>#<len>#LOCA: ... $ 14
+	// or heartbeat SYNC... 15
 	msg = strings.TrimSpace(msg)
 	msg = strings.TrimSuffix(msg, "$")
 
 	// Allow both "S168 # ..." and "S168#..."
 	msg = strings.ReplaceAll(msg, " ", "")
 	if !strings.HasPrefix(msg, "S168#") {
-		return nil, fmt.Errorf("not S168")
+	return nil, fmt.Errorf("not S168")
 	}
 
 	parts := strings.Split(msg, "#")
 	if len(parts) < 5 {
-		return nil, fmt.Errorf("invalid parts count")
+	return nil, fmt.Errorf("invalid parts count")
 	}
 
 	imei := parts[1]
@@ -951,18 +951,18 @@ func uniParse(msg string) (*uniMsg, error) {
 	u := &uniMsg{IMEI: imei, Serial: serial, Length: length}
 
 	if strings.HasPrefix(body, "LOCA") {
-		u.Type = "LOCA"
-		pos := uniParseLoca(body)
-		if pos != nil {
-			pos.Source = "UNIGUARD"
-			u.Position = pos
-		}
-		return u, nil
+	u.Type = "LOCA"
+	pos := uniParseLoca(body)
+	if pos != nil {
+	pos.Source = "UNIGUARD"
+	u.Position = pos
+	}
+	return u, nil
 	}
 
 	if strings.HasPrefix(body, "SYNC") {
-		u.Type = "SYNC"
-		return u, nil
+	u.Type = "SYNC"
+	return u, nil
 	}
 
 	// Other commands, still treat as connected
@@ -971,8 +971,8 @@ func uniParse(msg string) (*uniMsg, error) {
 }
 
 func uniParseLoca(body string) *AVLData {
-	// Example has GPS info in "GDATA: A, 12,160412154800,22.564025,113.242329,5.5,152,900;" :contentReference[oaicite:16]{index=16}
-	// It also defines lat/lon/speed/heading/alt meaning :contentReference[oaicite:17]{index=17}
+	// Example has GPS info in "GDATA: A, 12,160412154800,22.564025,113.242329,5.5,152,900;" 16
+	// It also defines lat/lon/speed/heading/alt meaning 17
 
 	// Normalize separators
 	b := strings.ReplaceAll(body, " ", "")
@@ -980,32 +980,32 @@ func uniParseLoca(body string) *AVLData {
 	// Find "GDATA:"
 	idx := strings.Index(b, "GDATA:")
 	if idx == -1 {
-		return nil
+	return nil
 	}
 	rest := b[idx+len("GDATA:"):]
 	// up to ';'
 	semi := strings.Index(rest, ";")
 	if semi != -1 {
-		rest = rest[:semi]
+	rest = rest[:semi]
 	}
 
 	// Split by commas
 	fields := strings.Split(rest, ",")
 	// common: [A][12][yyyymmddhhmmss][lat][lon][speed][heading][alt]
 	if len(fields) < 8 {
-		return nil
+	return nil
 	}
 
 	tsStr := fields[2]
 	ts, _ := time.ParseInLocation("060102150405", tsStr, time.UTC) // some devices send yyMMddHHmmss
 	if ts.IsZero() {
-		// some send 20160412154800 (yyyymmddhhmmss)
-		ts2, _ := time.ParseInLocation("20060102150405", tsStr, time.UTC)
-		if !ts2.IsZero() {
-			ts = ts2
-		} else {
-			ts = time.Now().UTC()
-		}
+	// some send 20160412154800 (yyyymmddhhmmss)
+	ts2, _ := time.ParseInLocation("20060102150405", tsStr, time.UTC)
+	if !ts2.IsZero() {
+	ts = ts2
+	} else {
+	ts = time.Now().UTC()
+	}
 	}
 
 	lat, _ := strconv.ParseFloat(fields[3], 64)
@@ -1015,33 +1015,33 @@ func uniParseLoca(body string) *AVLData {
 	alt, _ := strconv.ParseFloat(fields[7], 64)
 
 	return &AVLData{
-		Timestamp:  ts.UTC(),
-		Latitude:   lat,
-		Longitude:  lon,
-		Altitude:   int(alt),
-		Angle:      int(head),
-		Satellites: 0,
-		Speed:      int(spd),
-		IOData: map[string]interface{}{
-			"raw_gdata": rest,
-		},
-		Source: "UNIGUARD",
+	Timestamp:  ts.UTC(),
+	Latitude:   lat,
+	Longitude:  lon,
+	Altitude:   int(alt),
+	Angle:      int(head),
+	Satellites: 0,
+	Speed:      int(spd),
+	IOData: map[string]interface{}{
+	"raw_gdata": rest,
+	},
+	Source: "UNIGUARD",
 	}
 }
 
 func uniSendAck(conn net.Conn, serial string, kind string, extra string) error {
 	// Downstream formats:
-	// ACK ^ LOCA :contentReference[oaicite:18]{index=18}
-	// ACK ^ SYNC, utc time (yyyymmddhhmmss) :contentReference[oaicite:19]{index=19}
+	// ACK ^ LOCA 18
+	// ACK ^ SYNC, utc time (yyyymmddhhmmss) 19
 
 	imeiZeros := "000000000000000"
 	body := ""
 	if kind == "LOCA" {
-		body = "ACK^LOCA"
+	body = "ACK^LOCA"
 	} else if kind == "SYNC" {
-		body = "ACK^SYNC," + extra
+	body = "ACK^SYNC," + extra
 	} else {
-		body = "ACK^" + kind
+	body = "ACK^" + kind
 	}
 
 	// length field in their examples is "xxxx" = actual length; some devices ignore.
@@ -1066,18 +1066,18 @@ func uniAuth(imei, keyString string) string {
 func filterValid(records []*AVLData, imei string) []*AVLData {
 	valid := make([]*AVLData, 0, len(records))
 	for _, r := range records {
-		if r == nil {
-			continue
-		}
-		if r.Latitude == 0 || r.Longitude == 0 {
-			vLog("⚠️ Skipping zero coordinates (imei=%s): LAT=%.7f LNG=%.7f SAT=%d", imei, r.Latitude, r.Longitude, r.Satellites)
-			continue
-		}
-		if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
-			vLog("⚠️ Skipping out-of-range coordinates (imei=%s): LAT=%.7f LNG=%.7f", imei, r.Latitude, r.Longitude)
-			continue
-		}
-		valid = append(valid, r)
+	if r == nil {
+	continue
+	}
+	if r.Latitude == 0 || r.Longitude == 0 {
+	vLog("⚠️ Skipping zero coordinates (imei=%s): LAT=%.7f LNG=%.7f SAT=%d", imei, r.Latitude, r.Longitude, r.Satellites)
+	continue
+	}
+	if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+	vLog("⚠️ Skipping out-of-range coordinates (imei=%s): LAT=%.7f LNG=%.7f", imei, r.Latitude, r.Longitude)
+	continue
+	}
+	valid = append(valid, r)
 	}
 	return valid
 }
@@ -1085,70 +1085,70 @@ func filterValid(records []*AVLData, imei string) []*AVLData {
 func buildBackendPayload(deviceID int, imei string, recs []*AVLData) []map[string]interface{} {
 	payload := make([]map[string]interface{}, 0, len(recs))
 	for _, r := range recs {
-		payload = append(payload, map[string]interface{}{
-			"device_id":  deviceID,
-			"imei":       imei,
-			"timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
-			"latitude":   r.Latitude,
-			"longitude":  r.Longitude,
-			"speed":      r.Speed,
-			"angle":      r.Angle,
-			"altitude":   r.Altitude,
-			"satellites": r.Satellites,
-			"io_data":    r.IOData,
-			"source":     r.Source,
-		})
+	payload = append(payload, map[string]interface{}{
+	"device_id":  deviceID,
+	"imei":       imei,
+	"timestamp":  r.Timestamp.UTC().Format(time.RFC3339),
+	"latitude":   r.Latitude,
+	"longitude":  r.Longitude,
+	"speed":      r.Speed,
+	"angle":      r.Angle,
+	"altitude":   r.Altitude,
+	"satellites": r.Satellites,
+	"io_data":    r.IOData,
+	"source":     r.Source,
+	})
 	}
 	return payload
 }
 
 func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 	if len(recs) == 0 {
-		return nil
+	return nil
 	}
 
 	tx, err := db.Begin()
 	if err != nil {
-		return err
+	return err
 	}
 	defer tx.Rollback()
 
 	var stmt *sql.Stmt
 	if positionsHasIoData {
-		stmt, err = tx.Prepare(`
-			INSERT INTO positions 
-			(device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei, io_data)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		`)
+	stmt, err = tx.Prepare(`
+	INSERT INTO positions 
+	(device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei, io_data)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+	`)
 	} else {
-		stmt, err = tx.Prepare(`
-			INSERT INTO positions 
-			(device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		`)
+	stmt, err = tx.Prepare(`
+	INSERT INTO positions 
+	(device_id, lat, lng, speed, angle, altitude, satellites, timestamp, imei)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+	`)
 	}
 	if err != nil {
-		return err
+	return err
 	}
 	defer stmt.Close()
 
 	for _, r := range recs {
-		ioJSON, _ := json.Marshal(r.IOData)
+	ioJSON, _ := json.Marshal(r.IOData)
 
-		if positionsHasIoData {
-			_, err = stmt.Exec(
-				deviceID, r.Latitude, r.Longitude, r.Speed, r.Angle,
-				r.Altitude, r.Satellites, r.Timestamp.UTC(), imei, ioJSON,
-			)
-		} else {
-			_, err = stmt.Exec(
-				deviceID, r.Latitude, r.Longitude, r.Speed, r.Angle,
-				r.Altitude, r.Satellites, r.Timestamp.UTC(), imei,
-			)
-		}
-		if err != nil {
-			return err
-		}
+	if positionsHasIoData {
+	_, err = stmt.Exec(
+	deviceID, r.Latitude, r.Longitude, r.Speed, r.Angle,
+	r.Altitude, r.Satellites, r.Timestamp.UTC(), imei, ioJSON,
+	)
+	} else {
+	_, err = stmt.Exec(
+	deviceID, r.Latitude, r.Longitude, r.Speed, r.Angle,
+	r.Altitude, r.Satellites, r.Timestamp.UTC(), imei,
+	)
+	}
+	if err != nil {
+	return err
+	}
 	}
 
 	return tx.Commit()
@@ -1156,7 +1156,7 @@ func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 
 func postPositionsToBackend(positions []map[string]interface{}) error {
 	if len(positions) == 0 {
-		return nil
+	return nil
 	}
 
 	data, _ := json.Marshal(positions)
@@ -1165,7 +1165,7 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+	return err
 	}
 	defer resp.Body.Close()
 
@@ -1200,7 +1200,7 @@ func readU64(r *bytes.Reader) uint64 {
 
 func min(a, b int) int {
 	if a < b {
-		return a
+	return a
 	}
 	return b
 }
@@ -1208,7 +1208,7 @@ func min(a, b int) int {
 func getEnv(key, def string) string {
 	val := os.Getenv(key)
 	if val == "" {
-		return def
+	return def
 	}
 	return val
 }
