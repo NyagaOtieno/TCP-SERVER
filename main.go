@@ -23,6 +23,17 @@ import (
 	"github.com/joho/godotenv"
 )
 
+/*
+	✅ Supports:
+	  1) Teltonika FMB920 (Codec8 / Codec8E) over TCP with proper framing + ACK
+	  2) UniGuard ASCII protocol (Sxxx#IMEI#SERIAL#LEN#...$) with GDATA parsing + ACK
+
+	Notes:
+	  - Railway/Cloud: uses PORT env automatically (still honors TCP_SERVER_HOST if set)
+	  - Teltonika ACK is 4 bytes record count (NOT 5 bytes)
+	  - Teltonika framing is: 00000000 + dataLen(4) + data + CRC(4)
+*/
+
 type AVLData struct {
 	Timestamp  time.Time
 	Latitude   float64
@@ -49,18 +60,29 @@ var (
 	verbose            = true
 )
 
+// =========================
+// Logging
+// =========================
+
 func vLog(format string, a ...interface{}) {
 	if verbose {
 		log.Printf(format, a...)
 	}
 }
 
+// =========================
+// Init
+// =========================
+
 func init() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	_ = godotenv.Load()
 
-	tcpServerHost = getEnv("TCP_SERVER_HOST", "0.0.0.0:5027")
+	// Railway often sets PORT. If TCP_SERVER_HOST is provided, it wins.
+	port := getEnv("PORT", "5027")
+	tcpServerHost = getEnv("TCP_SERVER_HOST", "0.0.0.0:"+port)
+
 	backendTrackURL = getEnv("BACKEND_TRACK_URL", "https://mytrack-production.up.railway.app/api/track")
 
 	pgURL := getEnv("DATABASE_URL", "")
@@ -100,8 +122,12 @@ func checkPositionsHasIoData() bool {
 	return err == nil && col == "io_data"
 }
 
+// =========================
+// Main
+// =========================
+
 func main() {
-	vLog("🚀 Starting TCP tracker server (Teltonika + GT06 + UniGuard)...")
+	vLog("🚀 Starting TCP tracker server (Teltonika FMB920 + UniGuard)...")
 
 	listener, err := net.Listen("tcp", tcpServerHost)
 	if err != nil {
@@ -130,117 +156,36 @@ func main() {
 	}
 }
 
-// =====================================================
-//              PROTOCOL DETECTION + ROUTING
-// =====================================================
+// =========================
+// Protocol Detection
+// =========================
 
 type ProtocolKind int
 
 const (
 	ProtoTeltonika ProtocolKind = iota
-	ProtoGT06
 	ProtoUniGuard
 )
 
 func (p ProtocolKind) String() string {
 	switch p {
-	case ProtoGT06:
-		return "GT06"
 	case ProtoUniGuard:
 		return "UNIGUARD"
 	default:
-		return "TELTONIKA/UNKNOWN"
+		return "TELTONIKA"
 	}
 }
 
-func detectProtocolPeek(br *bufio.Reader) ProtocolKind {
-	peek, _ := br.Peek(64)
-
-	// GT06 can start with 0x78 0x78 OR 0x79 0x79
-	if len(peek) >= 2 && ((peek[0] == 0x78 && peek[1] == 0x78) || (peek[0] == 0x79 && peek[1] == 0x79)) {
-		return ProtoGT06
+func detectProtocolPeek(peek []byte) ProtocolKind {
+	// UniGuard is ASCII and commonly begins with 'S' and contains '#'
+	if len(peek) > 0 && (peek[0] == 'S' || peek[0] == 's') && bytes.Contains(peek, []byte("#")) {
+		return ProtoUniGuard
 	}
-
-	// UniGuard ASCII usually starts with 'S' and contains '#'
-	if len(peek) >= 1 && (peek[0] == 'S' || peek[0] == 's') {
-		if bytes.Contains(peek, []byte("#")) {
-			return ProtoUniGuard
-		}
+	// Fallback: if it contains '#', likely UniGuard
+	if bytes.Contains(peek, []byte("#")) && bytes.Contains(peek, []byte("$")) {
+		return ProtoUniGuard
 	}
-
-	// Teltonika IMEI handshake header 00 0F
-	if len(peek) >= 2 && peek[0] == 0x00 && peek[1] == 0x0F {
-		return ProtoTeltonika
-	}
-
-	// Unknown -> route to Teltonika/Unknown with safe fallbacks
 	return ProtoTeltonika
-}
-
-func handleConnection(conn net.Conn) {
-	defer wg.Done()
-	defer conn.Close()
-
-	remote := conn.RemoteAddr().String()
-	vLog("🔗 New connection from %s", remote)
-
-	br := bufio.NewReaderSize(conn, 128*1024)
-
-	// Give device short time to send first bytes so we can log them
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	peek, _ := br.Peek(64)
-	_ = conn.SetReadDeadline(time.Time{})
-
-	if len(peek) > 0 {
-		vLog("👀 First bytes HEX (%d): %s", len(peek), hex.EncodeToString(peek))
-		vLog("👀 First bytes ASCII: %q", sanitizeASCII(peek))
-	} else {
-		vLog("⚠️ No data received on connect from %s", remote)
-	}
-
-	kind := detectProtocolPeek(br)
-	vLog("🧭 Protocol guess from %s: %s", remote, kind.String())
-
-	switch kind {
-	case ProtoGT06:
-		handleGT06(br, conn)
-		return
-	case ProtoUniGuard:
-		handleUniGuard(br, conn)
-		return
-	default:
-		// 1) Teltonika normal IMEI (00 0F + 15 digits)
-		if imei, err := readTeltonikaIMEIHandshake(br, conn); err == nil {
-			handleTeltonikaAfterIMEI(br, conn, imei)
-			return
-		}
-
-		// 2) Teltonika IMEI sometimes comes as plain ASCII digits (no 00 0F)
-		if imei, ok := tryReadPlainIMEI(br, conn); ok {
-			vLog("📡 Teltonika (plain IMEI) device connected: %s", imei)
-			handleTeltonikaAfterIMEI(br, conn, imei)
-			return
-		}
-
-		// 3) Fallback GT06 (78/79)
-		if p, _ := br.Peek(2); len(p) == 2 && ((p[0] == 0x78 && p[1] == 0x78) || (p[0] == 0x79 && p[1] == 0x79)) {
-			vLog("🔁 Fallback detected GT06 (78/79)")
-			handleGT06(br, conn)
-			return
-		}
-
-		// 4) Fallback UniGuard if it looks like ASCII with '#'
-		if bytes.Contains(peek, []byte("#")) || (len(peek) > 0 && (peek[0] == 'S' || peek[0] == 's')) {
-			vLog("🔁 Fallback detected UniGuard")
-			handleUniGuard(br, conn)
-			return
-		}
-
-		// Capture more before closing (helps you identify unknown device)
-		vLog("⚠️ Unknown protocol from %s, capturing more bytes...", remote)
-		captureMore(br, conn)
-		return
-	}
 }
 
 func sanitizeASCII(b []byte) string {
@@ -255,83 +200,57 @@ func sanitizeASCII(b []byte) string {
 	return string(out)
 }
 
-func captureMore(br *bufio.Reader, conn net.Conn) {
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 256)
-	n, err := br.Read(buf)
+// =========================
+// Connection Handling
+// =========================
+
+func handleConnection(conn net.Conn) {
+	defer wg.Done()
+	defer conn.Close()
+
+	remote := conn.RemoteAddr().String()
+	vLog("🔗 New connection from %s", remote)
+
+	br := bufio.NewReaderSize(conn, 128*1024)
+
+	// Peek first bytes for protocol selection
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	peek, _ := br.Peek(64)
 	_ = conn.SetReadDeadline(time.Time{})
 
-	if n > 0 {
-		vLog("🧾 Extra bytes HEX (%d): %s", n, hex.EncodeToString(buf[:n]))
-		vLog("🧾 Extra bytes ASCII: %q", sanitizeASCII(buf[:n]))
+	if len(peek) > 0 {
+		vLog("👀 First bytes HEX (%d): %s", len(peek), hex.EncodeToString(peek))
+		vLog("👀 First bytes ASCII: %q", sanitizeASCII(peek))
+	} else {
+		vLog("⚠️ No data received on connect from %s", remote)
+		// still continue; some devices are slow
 	}
-	if err != nil && err != io.EOF {
-		vLog("🧾 Extra read error: %v", err)
+
+	kind := detectProtocolPeek(peek)
+	vLog("🧭 Protocol guess from %s: %s", remote, kind.String())
+
+	switch kind {
+	case ProtoUniGuard:
+		handleUniGuard(br, conn)
+		return
+	default:
+		handleTeltonika(br, conn)
+		return
 	}
 }
 
-// =====================================================
-//                    TELTONIKA (FMB/FMC)
-// =====================================================
+// =========================
+// TELTONIKA (FMB920) HANDLER
+// =========================
 
-// Reads ONLY Teltonika IMEI handshake if header matches 00 0F.
-// If it isn't Teltonika, returns error WITHOUT consuming bytes.
-func readTeltonikaIMEIHandshake(br *bufio.Reader, conn net.Conn) (string, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+func handleTeltonika(br *bufio.Reader, conn net.Conn) {
+	remote := conn.RemoteAddr().String()
 
-	p2, err := br.Peek(2)
+	imei, err := readTeltonikaIMEI(br, conn)
 	if err != nil {
-		return "", err
+		vLog("❌ Failed IMEI read (Teltonika) from %s: %v", remote, err)
+		return
 	}
-	if len(p2) < 2 || p2[0] != 0x00 || p2[1] != 0x0F {
-		return "", fmt.Errorf("not teltonika imei header")
-	}
-
-	// consume 2 header bytes
-	_, _ = br.ReadByte()
-	_, _ = br.ReadByte()
-
-	imeiBytes := make([]byte, 15)
-	if _, err := io.ReadFull(br, imeiBytes); err != nil {
-		return "", err
-	}
-
-	imei := strings.TrimSpace(string(imeiBytes))
-	if !regexp.MustCompile(`^\d{15}$`).MatchString(imei) {
-		return "", fmt.Errorf("invalid teltonika imei: %q", imei)
-	}
-
-	// Teltonika requires 0x01 ACK after IMEI
-	_, _ = conn.Write([]byte{0x01})
-	return imei, nil
-}
-
-// Some devices send IMEI directly as ASCII digits without the 00 0F prefix.
-// We ONLY accept this if the connection starts with 15 contiguous digits.
-func tryReadPlainIMEI(br *bufio.Reader, conn net.Conn) (string, bool) {
-	_ = conn.SetReadDeadline(time.Now().Add(8 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-
-	p, err := br.Peek(32)
-	if err != nil || len(p) < 15 {
-		return "", false
-	}
-
-	head := string(p[:15])
-	if !regexp.MustCompile(`^\d{15}$`).MatchString(head) {
-		return "", false
-	}
-
-	// consume exactly 15 bytes
-	_, _ = br.Discard(15)
-
-	// treat like teltonika ack for IMEI
-	_, _ = conn.Write([]byte{0x01})
-	return head, true
-}
-
-func handleTeltonikaAfterIMEI(br *bufio.Reader, conn net.Conn, imei string) {
 	vLog("📡 Teltonika device connected: %s", imei)
 
 	deviceID, err := ensureDevice(imei)
@@ -340,11 +259,12 @@ func handleTeltonikaAfterIMEI(br *bufio.Reader, conn net.Conn, imei string) {
 		return
 	}
 
-	residual := make([]byte, 0, 4096)
+	// Teltonika streaming parser
+	residual := make([]byte, 0, 8192)
 	tmp := make([]byte, 4096)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		conn.SetReadDeadline(time.Now().Add(15 * time.Minute))
 		n, err := br.Read(tmp)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -361,20 +281,18 @@ func handleTeltonikaAfterIMEI(br *bufio.Reader, conn net.Conn, imei string) {
 			vLog("📥 Residual buffer length: %d", len(residual))
 		}
 
-		// Teltonika frame:
-		// 4 bytes preamble (00000000)
-		// 4 bytes data length (N)
-		// N bytes data (codec8/8e...)
-		// 4 bytes CRC
 		for {
+			// Teltonika framing needs at least 8 bytes:
+			// preamble (4) + dataLen (4)
 			if len(residual) < 8 {
 				break
 			}
 
-			// resync to preamble 00000000
+			// Resync to preamble 00000000
 			if binary.BigEndian.Uint32(residual[:4]) != 0 {
 				idx := bytes.Index(residual, []byte{0x00, 0x00, 0x00, 0x00})
 				if idx == -1 {
+					// keep last few bytes to allow resync
 					if len(residual) > 3 {
 						residual = residual[len(residual)-3:]
 					}
@@ -388,61 +306,42 @@ func handleTeltonikaAfterIMEI(br *bufio.Reader, conn net.Conn, imei string) {
 
 			dataLen := int(binary.BigEndian.Uint32(residual[4:8]))
 			if dataLen <= 0 || dataLen > 5*1024*1024 {
-				vLog("⚠️ Invalid dataLen %d from %s, resync...", dataLen, imei)
+				vLog("⚠️ Invalid Teltonika dataLen=%d from %s (resync)", dataLen, imei)
 				residual = residual[1:]
 				continue
 			}
 
-			total := 8 + dataLen + 4
-			if len(residual) < total {
+			totalLen := 8 + dataLen + 4 // + CRC
+			if len(residual) < totalLen {
 				break
 			}
 
 			data := residual[8 : 8+dataLen]
-			_ = residual[8+dataLen : total] // crc available if needed
+			// crc := residual[8+dataLen : totalLen] // available if you want to validate later
 
 			codecPayload, err := normalizeToCodec8(data)
 			if err != nil {
 				vLog("❌ Codec normalization failed: %v", err)
-				residual = residual[total:]
+				residual = residual[totalLen:]
 				continue
 			}
 
 			records, err := parseCodec(codecPayload)
 			if err != nil {
 				vLog("❌ Frame parse error: %v", err)
-				residual = residual[total:]
+				residual = residual[totalLen:]
 				continue
 			}
 
-			valid := make([]*AVLData, 0, len(records))
-			for _, r := range records {
-				if r == nil {
-					continue
-				}
-
-				if r.Latitude == 0 || r.Longitude == 0 {
-					vLog("⚠️ Skipping zero coordinates: LAT=%.7f LNG=%.7f SAT=%d", r.Latitude, r.Longitude, r.Satellites)
-					continue
-				}
-				if r.Satellites == 0 {
-					vLog("⚠️ Skipping record with zero satellites: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
-					continue
-				}
-				if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
-					vLog("⚠️ Skipping out-of-range coordinates: LAT=%.7f LNG=%.7f", r.Latitude, r.Longitude)
-					continue
-				}
-				valid = append(valid, r)
-			}
-
+			valid := filterValidPositions(records, imei)
 			vLog("🔎 Parsed %d valid AVL records", len(valid))
 
 			if err := storePositionsBatch(deviceID, imei, valid); err != nil {
 				vLog("❌ DB batch insert failed: %v", err)
 			}
 
-			payload := []map[string]interface{}{}
+			// Post to backend
+			payload := make([]map[string]interface{}, 0, len(valid))
 			for _, r := range valid {
 				payload = append(payload, map[string]interface{}{
 					"device_id":  deviceID,
@@ -462,286 +361,69 @@ func handleTeltonikaAfterIMEI(br *bufio.Reader, conn net.Conn, imei string) {
 			// ✅ Correct Teltonika ACK: 4 bytes accepted record count
 			sendTeltonikaACK(conn, len(valid))
 
-			residual = residual[total:]
+			residual = residual[totalLen:]
 		}
 	}
 }
 
-func sendTeltonikaACK(conn net.Conn, count int) {
+func readTeltonikaIMEI(br *bufio.Reader, conn net.Conn) (string, error) {
+	// Teltonika IMEI packet: 00 0F + 15 ASCII digits
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
+	p2, err := br.Peek(2)
+	if err != nil {
+		return "", err
+	}
+	if len(p2) < 2 || p2[0] != 0x00 || p2[1] != 0x0F {
+		// Some devices may send plain digits; try that too (15 digits)
+		p, _ := br.Peek(32)
+		if len(p) >= 15 && regexp.MustCompile(`^\d{15}$`).Match(p[:15]) {
+			imei := string(p[:15])
+			_, _ = br.Discard(15)
+			_, _ = conn.Write([]byte{0x01})
+			return imei, nil
+		}
+		return "", fmt.Errorf("not a Teltonika IMEI handshake")
+	}
+
+	_, _ = br.ReadByte() // 00
+	_, _ = br.ReadByte() // 0F
+
+	imeiBytes := make([]byte, 15)
+	if _, err := io.ReadFull(br, imeiBytes); err != nil {
+		return "", err
+	}
+
+	imei := strings.TrimSpace(string(imeiBytes))
+	if !regexp.MustCompile(`^\d{15}$`).MatchString(imei) {
+		return "", fmt.Errorf("invalid IMEI: %q", imei)
+	}
+
+	// Teltonika ACK after IMEI
+	_, _ = conn.Write([]byte{0x01})
+	return imei, nil
+}
+
+func sendTeltonikaACK(conn net.Conn, accepted int) {
 	ack := make([]byte, 4)
-	binary.BigEndian.PutUint32(ack, uint32(count))
+	binary.BigEndian.PutUint32(ack, uint32(accepted))
 	_, _ = conn.Write(ack)
 }
 
-// =====================================================
-//                    GT06 (0x78/0x79)
-// =====================================================
-
-func handleGT06(br *bufio.Reader, conn net.Conn) {
-	remote := conn.RemoteAddr().String()
-	vLog("📡 GT06 connection from %s", remote)
-
-	imei, startHi, startLo, serial, err := readGT06Login(br)
-	if err != nil {
-		vLog("❌ GT06 login failed: %v", err)
-		return
-	}
-	vLog("✅ GT06 login IMEI=%s serial=0x%04X (start=%02x%02x)", imei, serial, startHi, startLo)
-
-	// ACK login
-	_ = writeGT06Ack(conn, startHi, startLo, 0x01, serial)
-
-	deviceID, err := ensureDevice(imei)
-	if err != nil {
-		vLog("❌ Device lookup failed for IMEI %s: %v", imei, err)
-		return
-	}
-
-	for {
-		conn.SetReadDeadline(time.Now().Add(20 * time.Minute))
-		pkt, startHi, startLo, proto, serial, err := readGT06Packet(br)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				vLog("⏱ GT06 timeout for %s, closing", imei)
-				return
-			}
-			if err != io.EOF {
-				vLog("🔌 GT06 read error for %s: %v", imei, err)
-			}
-			return
-		}
-
-		switch proto {
-		case 0x12, 0x16: // location / alarm location
-			rec, ok := parseGT06Location(pkt)
-			if ok {
-				processOnePosition(deviceID, imei, rec)
-			}
-			_ = writeGT06Ack(conn, startHi, startLo, proto, serial)
-
-		case 0x13: // heartbeat
-			_ = writeGT06Ack(conn, startHi, startLo, proto, serial)
-
-		default:
-			vLog("ℹ️ GT06 proto 0x%02X len=%d", proto, len(pkt))
-			_ = writeGT06Ack(conn, startHi, startLo, proto, serial)
-		}
-	}
-}
-
-func readGT06Login(br *bufio.Reader) (imei string, startHi, startLo byte, serial uint16, err error) {
-	pkt, sh, sl, proto, ser, err := readGT06Packet(br)
-	if err != nil {
-		return "", 0, 0, 0, err
-	}
-	if proto != 0x01 {
-		return "", 0, 0, 0, fmt.Errorf("expected login proto 0x01, got 0x%02X", proto)
-	}
-	// login has 8-byte terminal id after proto
-	if len(pkt) < 2+1+1+8+2+2+2 {
-		return "", 0, 0, 0, fmt.Errorf("login packet too short: %d", len(pkt))
-	}
-	terminalID := pkt[2+1+1 : 2+1+1+8]
-	imei = gt06TerminalIDToIMEI(terminalID)
-	return imei, sh, sl, ser, nil
-}
-
-// returns raw packet including header/len/body/stop
-func readGT06Packet(br *bufio.Reader) (raw []byte, startHi, startLo, proto byte, serial uint16, err error) {
-	for {
-		b1, err := br.ReadByte()
-		if err != nil {
-			return nil, 0, 0, 0, 0, err
-		}
-		if b1 != 0x78 && b1 != 0x79 {
-			continue
-		}
-		b2, err := br.ReadByte()
-		if err != nil {
-			return nil, 0, 0, 0, 0, err
-		}
-		if b2 != b1 { // 78 78 or 79 79
-			continue
-		}
-
-		lenByte, err := br.ReadByte()
-		if err != nil {
-			return nil, 0, 0, 0, 0, err
-		}
-		l := int(lenByte)
-		if l < 5 || l > 255 {
-			continue
-		}
-
-		body := make([]byte, l)
-		if _, err := io.ReadFull(br, body); err != nil {
-			return nil, 0, 0, 0, 0, err
-		}
-
-		stop := make([]byte, 2)
-		if _, err := io.ReadFull(br, stop); err != nil {
-			return nil, 0, 0, 0, 0, err
-		}
-		if stop[0] != 0x0D || stop[1] != 0x0A {
-			continue
-		}
-
-		raw = append([]byte{b1, b2, lenByte}, body...)
-		raw = append(raw, stop...)
-
-		proto = body[0]
-		serial = binary.BigEndian.Uint16(body[l-4 : l-2]) // serial before crc
-		return raw, b1, b2, proto, serial, nil
-	}
-}
-
-func writeGT06Ack(w io.Writer, startHi, startLo, proto byte, serial uint16) error {
-	// 78 78 05 <proto> <serial> <crc> 0D 0A   (also works with 79 79)
-	pkt := make([]byte, 0, 10)
-	pkt = append(pkt, startHi, startLo, 0x05, proto)
-	pkt = append(pkt, 0x00, 0x00)
-	binary.BigEndian.PutUint16(pkt[4:6], serial)
-
-	crcInput := []byte{0x05, proto, byte(serial >> 8), byte(serial & 0xFF)}
-	crc := crcITU(crcInput)
-	pkt = append(pkt, byte(crc>>8), byte(crc&0xFF))
-	pkt = append(pkt, 0x0D, 0x0A)
-
-	_, err := w.Write(pkt)
-	return err
-}
-
-func parseGT06Location(raw []byte) (*AVLData, bool) {
-	// raw: 78/79 78/79 <len> <body(len bytes)> 0D 0A
-	if len(raw) < 5 {
-		return nil, false
-	}
-	length := int(raw[2])
-	if len(raw) < 3+length+2 {
-		return nil, false
-	}
-	body := raw[3 : 3+length] // proto..crc
-
-	if len(body) < 1+6+1+4+4+1+2 {
-		return nil, false
-	}
-
-	proto := body[0]
-	if proto != 0x12 && proto != 0x16 {
-		return nil, false
-	}
-
-	i := 1
-	dt := body[i : i+6]
-	i += 6
-
-	gpsLenSat := body[i]
-	i++
-	sats := int(gpsLenSat & 0x0F)
-
-	latRaw := binary.BigEndian.Uint32(body[i : i+4])
-	i += 4
-	lonRaw := binary.BigEndian.Uint32(body[i : i+4])
-	i += 4
-
-	speed := int(body[i])
-	i++
-
-	cs := binary.BigEndian.Uint16(body[i : i+2]) // course/status
-	angle := int(cs & 0x03FF)
-
-	status := byte(cs >> 8)
-	lonWest := (status & (1 << 3)) != 0
-	latNorth := (status & (1 << 2)) != 0
-
-	// Convert: raw = (deg*60 + minutes) * 30000
-	lat := float64(latRaw) / 30000.0 / 60.0
-	lon := float64(lonRaw) / 30000.0 / 60.0
-
-	if !latNorth {
-		lat = -lat
-	}
-	if lonWest {
-		lon = -lon
-	}
-
-	ts, ok := parseGT06DateTime(dt)
-	if !ok {
-		ts = time.Now().UTC()
-	}
-
-	return &AVLData{
-		Timestamp:  ts,
-		Latitude:   lat,
-		Longitude:  lon,
-		Altitude:   0,
-		Angle:      angle,
-		Satellites: sats,
-		Speed:      speed,
-		IOData:     map[uint8]interface{}{},
-	}, true
-}
-
-func parseGT06DateTime(b []byte) (time.Time, bool) {
-	if len(b) != 6 {
-		return time.Time{}, false
-	}
-	yy := int(b[0])
-	year := 2000 + yy
-	month := time.Month(int(b[1]))
-	day := int(b[2])
-	h := int(b[3])
-	m := int(b[4])
-	s := int(b[5])
-
-	if month < 1 || month > 12 || day < 1 || day > 31 || h > 23 || m > 59 || s > 59 {
-		return time.Time{}, false
-	}
-	return time.Date(year, month, day, h, m, s, 0, time.UTC), true
-}
-
-func gt06TerminalIDToIMEI(b []byte) string {
-	// terminal id is 8 bytes (BCD-like). Often yields 16 digits with leading 0.
-	var sb strings.Builder
-	for _, x := range b {
-		hi := (x >> 4) & 0x0F
-		lo := x & 0x0F
-		sb.WriteByte('0' + hi)
-		sb.WriteByte('0' + lo)
-	}
-	s := sb.String()
-	if len(s) >= 15 {
-		return s[len(s)-15:]
-	}
-	return fmt.Sprintf("%015s", s)
-}
-
-func crcITU(data []byte) uint16 {
-	var crc uint16 = 0xFFFF
-	for _, b := range data {
-		crc ^= uint16(b) << 8
-		for i := 0; i < 8; i++ {
-			if (crc & 0x8000) != 0 {
-				crc = (crc << 1) ^ 0x1021
-			} else {
-				crc <<= 1
-			}
-		}
-	}
-	return crc
-}
-
-// =====================================================
-//                    UNIGUARD (ASCII Sxxx#...$)
-// =====================================================
+// =========================
+// UNIGUARD HANDLER
+// =========================
 
 func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 	remote := conn.RemoteAddr().String()
 	vLog("📡 UniGuard connection from %s", remote)
 
+	// UniGuard is line-like messages ending with '$'
 	for {
 		conn.SetReadDeadline(time.Now().Add(30 * time.Minute))
-		line, err := br.ReadString('$')
+
+		msg, err := br.ReadString('$')
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				vLog("⏱ UniGuard timeout, closing %s", remote)
@@ -753,18 +435,17 @@ func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 			return
 		}
 
-		msg := strings.TrimSpace(line)
+		msg = strings.TrimSpace(msg)
 		if msg == "" {
 			continue
 		}
 		vLog("🟢 UniGuard raw: %s", msg)
 
-		imei, serialHex, rec, ok := parseUniGuard(msg)
+		imei, serialHex, rec, ok := parseUniGuardMessage(msg)
 		if !ok {
-			vLog("⚠️ UniGuard parse failed (no/short GDATA?)")
+			vLog("⚠️ UniGuard parse failed (no usable GDATA)")
 			continue
 		}
-		vLog("✅ UniGuard IMEI=%s serial=%s", imei, serialHex)
 
 		deviceID, err := ensureDevice(imei)
 		if err != nil {
@@ -772,15 +453,44 @@ func handleUniGuard(br *bufio.Reader, conn net.Conn) {
 			continue
 		}
 
-		processOnePosition(deviceID, imei, rec)
+		valid := filterValidPositions([]*AVLData{rec}, imei)
+		if len(valid) == 0 {
+			// still ACK so device doesn't keep retrying forever
+			ack := buildUniGuardAck("S168", imei, serialHex, "LOCA")
+			_, _ = conn.Write([]byte(ack))
+			continue
+		}
 
+		if err := storePositionsBatch(deviceID, imei, valid); err != nil {
+			vLog("❌ DB insert failed (UniGuard): %v", err)
+		}
+
+		payload := []map[string]interface{}{
+			{
+				"device_id":  deviceID,
+				"imei":       imei,
+				"timestamp":  valid[0].Timestamp.UTC().Format(time.RFC3339),
+				"latitude":   valid[0].Latitude,
+				"longitude":  valid[0].Longitude,
+				"speed":      valid[0].Speed,
+				"angle":      valid[0].Angle,
+				"altitude":   valid[0].Altitude,
+				"satellites": valid[0].Satellites,
+				"io_data":    valid[0].IOData,
+			},
+		}
+		_ = postPositionsToBackend(payload)
+
+		// ACK
 		ack := buildUniGuardAck("S168", imei, serialHex, "LOCA")
 		_, _ = conn.Write([]byte(ack))
 	}
 }
 
-func parseUniGuard(msg string) (imei string, serialHex string, rec *AVLData, ok bool) {
+func parseUniGuardMessage(msg string) (imei string, serialHex string, rec *AVLData, ok bool) {
+	msg = strings.TrimSpace(msg)
 	msg = strings.TrimSuffix(msg, "$")
+
 	parts := strings.Split(msg, "#")
 	if len(parts) < 5 {
 		return "", "", nil, false
@@ -788,17 +498,20 @@ func parseUniGuard(msg string) (imei string, serialHex string, rec *AVLData, ok 
 	for i := range parts {
 		parts[i] = strings.TrimSpace(parts[i])
 	}
+
+	// Sxxx#IMEI#SERIAL#LEN#CONTENT
 	imei = parts[1]
 	serialHex = parts[2]
-
 	content := strings.TrimSpace(strings.Join(parts[4:], "#"))
-	if content == "" {
-		return imei, serialHex, nil, false
+	if imei == "" || serialHex == "" || content == "" {
+		return "", "", nil, false
 	}
 
-	sections := strings.Split(content, ";")
-	var gdata string
-	for _, s := range sections {
+	// Find "GDATA:" block (common in UniGuard protocol docs)
+	// Example: ...;GDATA:A,12,160412154800,22.564025,113.242329,5.5,152,900;...
+	gdata := ""
+	segments := strings.Split(content, ";")
+	for _, s := range segments {
 		s = strings.TrimSpace(s)
 		if strings.HasPrefix(strings.ToUpper(s), "GDATA:") {
 			gdata = strings.TrimSpace(s[len("GDATA:"):])
@@ -806,15 +519,15 @@ func parseUniGuard(msg string) (imei string, serialHex string, rec *AVLData, ok 
 		}
 	}
 	if gdata == "" {
-		return imei, serialHex, nil, false
+		return "", "", nil, false
 	}
 
 	fields := splitCSVLoose(gdata)
 	if len(fields) < 8 {
-		return imei, serialHex, nil, false
+		return "", "", nil, false
 	}
 
-	// Example: A,12,160412154800,22.564025,113.242329,5.5,152,900
+	// fields: [A, sats, yymmddhhmmss, lat, lon, speed, heading, altitude]
 	sats, _ := strconv.Atoi(fields[1])
 	tRaw := fields[2]
 	lat, _ := strconv.ParseFloat(fields[3], 64)
@@ -848,66 +561,57 @@ func splitCSVLoose(s string) []string {
 	out := make([]string, 0, len(raw))
 	for _, r := range raw {
 		t := strings.TrimSpace(r)
-		if t == "" {
-			continue
+		if t != "" {
+			out = append(out, t)
 		}
-		out = append(out, t)
 	}
 	return out
 }
 
 func buildUniGuardAck(id, imei, serialHex, keyword string) string {
+	// Common ACK style: S168#<imei>#<serial>#<lenHex>#ACK^<keyword>$
 	content := "ACK^" + keyword
 	lengthHex := fmt.Sprintf("%04x", len(content))
 	return fmt.Sprintf("%s#%s#%s#%s#%s$", id, imei, serialHex, lengthHex, content)
 }
 
-// =====================================================
-//           SHARED: POSITION PROCESSING + VALIDATION
-// =====================================================
+// =========================
+// Shared Validations
+// =========================
 
-func processOnePosition(deviceID int, imei string, rec *AVLData) {
-	if rec == nil {
-		return
-	}
+func filterValidPositions(records []*AVLData, imei string) []*AVLData {
+	valid := make([]*AVLData, 0, len(records))
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
 
-	if rec.Latitude == 0 || rec.Longitude == 0 {
-		vLog("⚠️ Skipping zero coordinates (imei=%s): LAT=%.7f LNG=%.7f", imei, rec.Latitude, rec.Longitude)
-		return
-	}
-	if rec.Satellites == 0 {
-		vLog("⚠️ Skipping record with zero satellites (imei=%s)", imei)
-		return
-	}
-	if rec.Latitude < -90 || rec.Latitude > 90 || rec.Longitude < -180 || rec.Longitude > 180 {
-		vLog("⚠️ Skipping out-of-range coordinates (imei=%s): LAT=%.7f LNG=%.7f", imei, rec.Latitude, rec.Longitude)
-		return
-	}
+		// Skip zero coordinates
+		if r.Latitude == 0 || r.Longitude == 0 {
+			vLog("⚠️ Skipping zero coordinates (imei=%s): LAT=%.7f LNG=%.7f SAT=%d", imei, r.Latitude, r.Longitude, r.Satellites)
+			continue
+		}
 
-	if err := storePositionsBatch(deviceID, imei, []*AVLData{rec}); err != nil {
-		vLog("❌ DB insert failed: %v", err)
-	}
+		// Skip records without satellites
+		if r.Satellites == 0 {
+			vLog("⚠️ Skipping record with zero satellites (imei=%s): LAT=%.7f LNG=%.7f", imei, r.Latitude, r.Longitude)
+			continue
+		}
 
-	payload := []map[string]interface{}{
-		{
-			"device_id":  deviceID,
-			"imei":       imei,
-			"timestamp":  rec.Timestamp.UTC().Format(time.RFC3339),
-			"latitude":   rec.Latitude,
-			"longitude":  rec.Longitude,
-			"speed":      rec.Speed,
-			"angle":      rec.Angle,
-			"altitude":   rec.Altitude,
-			"satellites": rec.Satellites,
-			"io_data":    rec.IOData,
-		},
+		// Skip out-of-range coordinates
+		if r.Latitude < -90 || r.Latitude > 90 || r.Longitude < -180 || r.Longitude > 180 {
+			vLog("⚠️ Skipping out-of-range coordinates (imei=%s): LAT=%.7f LNG=%.7f", imei, r.Latitude, r.Longitude)
+			continue
+		}
+
+		valid = append(valid, r)
 	}
-	_ = postPositionsToBackend(payload)
+	return valid
 }
 
-// =====================================================
-//                 DEVICE HANDLING
-// =====================================================
+// =========================
+// Device lookup
+// =========================
 
 func ensureDevice(imei string) (int, error) {
 	var id int
@@ -939,9 +643,9 @@ func ensureDevice(imei string) (int, error) {
 	return 0, fmt.Errorf("device IMEI %s not found", imei)
 }
 
-// =====================================================
-//                 TELTONIKA CODEC PARSING
-// =====================================================
+// =========================
+// Teltonika Codec parsing
+// =========================
 
 func normalizeToCodec8(frame []byte) ([]byte, error) {
 	if len(frame) == 0 {
@@ -1046,12 +750,11 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		return v
 	}
 
-	// codec8/8e IO:
-	// event IO id (1 byte)
-	// total IO count (1 byte)
+	// Teltonika IO: eventIO (1), totalIO (1), then groups
 	_ = readByte()
 	_ = readByte()
 
+	// 1-byte values
 	n1 := int(readByte())
 	for i := 0; i < n1; i++ {
 		id := readByte()
@@ -1059,6 +762,7 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
+	// 2-byte values
 	n2 := int(readByte())
 	for i := 0; i < n2; i++ {
 		id := readByte()
@@ -1066,6 +770,7 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
+	// 4-byte values
 	n4 := int(readByte())
 	for i := 0; i < n4; i++ {
 		id := readByte()
@@ -1073,6 +778,7 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 		ioData[id] = val
 	}
 
+	// 8-byte values
 	n8 := int(readByte())
 	for i := 0; i < n8; i++ {
 		id := readByte()
@@ -1083,9 +789,9 @@ func parseIOElements(r *bytes.Reader) (map[uint8]interface{}, error) {
 	return ioData, nil
 }
 
-// =====================================================
-//                 DATABASE + BACKEND
-// =====================================================
+// =========================
+// Database + Backend
+// =========================
 
 func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 	if len(recs) == 0 {
@@ -1131,7 +837,6 @@ func storePositionsBatch(deviceID int, imei string, recs []*AVLData) error {
 				r.Altitude, r.Satellites, r.Timestamp.UTC(), imei,
 			)
 		}
-
 		if err != nil {
 			return err
 		}
@@ -1161,9 +866,9 @@ func postPositionsToBackend(positions []map[string]interface{}) error {
 	return nil
 }
 
-// =====================================================
-//                 UTILITY
-// =====================================================
+// =========================
+// Utility
+// =========================
 
 func getEnv(key, def string) string {
 	val := os.Getenv(key)
@@ -1171,14 +876,4 @@ func getEnv(key, def string) string {
 		return def
 	}
 	return val
-}
-
-// (kept if you need it later)
-func parseHexU16(s string) uint16 {
-	s = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(s), "0x"))
-	if s == "" {
-		return 0
-	}
-	v, _ := strconv.ParseUint(s, 16, 16)
-	return uint16(v)
 }
