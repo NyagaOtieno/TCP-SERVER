@@ -171,9 +171,11 @@ func handleConnection(conn net.Conn) {
 	br := bufio.NewReaderSize(conn, 64*1024)
 
 	// Give devices time to send first bytes
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	proto, first, err := detectProtocol(br)
-	conn.SetReadDeadline(time.Time{})
+	// give trackers more time to speak on first connect
+conn.SetReadDeadline(time.Now().Add(180 * time.Second))
+proto, first, err := detectProtocol(br) // this will Peek()
+conn.SetReadDeadline(time.Time{})
+
 	if err != nil {
 		vLog("⚠️ Protocol detect failed from %s: %v", remote, err)
 		return
@@ -198,42 +200,47 @@ func handleConnection(conn net.Conn) {
 }
 
 func detectProtocol(br *bufio.Reader) (Protocol, []byte, error) {
-	peek, err := br.Peek(32)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", nil, err
-	}
-	if len(peek) == 0 {
-		return "", nil, fmt.Errorf("no data")
-	}
+	deadline := time.Now().Add(180 * time.Second)
+	for {
+		peek, err := br.Peek(32)
+		if len(peek) == 0 {
+			if err != nil {
+				// keep waiting until our own deadline hits
+				if time.Now().Before(deadline) {
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				return "", nil, fmt.Errorf("no data")
+			}
+			if time.Now().Before(deadline) {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			return "", nil, fmt.Errorf("no data")
+		}
 
-	// Teltonika IMEI handshake: 00 0F + 15 ASCII digits
-	if len(peek) >= 2 && peek[0] == 0x00 && peek[1] == 0x0F {
-		return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
-	}
+		if len(peek) >= 2 && peek[0] == 0x00 && peek[1] == 0x0F {
+			return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
+		}
+		if len(peek) >= 4 && bytes.Equal(peek[:4], []byte{0, 0, 0, 0}) {
+			return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
+		}
+		if len(peek) >= 2 && ((peek[0] == 0x78 && peek[1] == 0x78) || (peek[0] == 0x79 && peek[1] == 0x79)) {
+			return PROTO_GT06, peek[:min(32, len(peek))], nil
+		}
 
-	// Teltonika AVL preamble can start with 00 00 00 00
-	if len(peek) >= 4 && bytes.Equal(peek[:4], []byte{0, 0, 0, 0}) {
-		return PROTO_TELTONIKA, peek[:min(32, len(peek))], nil
-	}
+		trim := strings.TrimSpace(string(peek))
+		if strings.HasPrefix(trim, "S168") {
+			return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
+		}
+		if isMostlyASCII(peek) && bytes.Contains(peek, []byte("#")) && bytes.Contains(peek, []byte("S168")) {
+			return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
+		}
 
-	// GT06: 78 78 or 79 79
-	if len(peek) >= 2 && ((peek[0] == 0x78 && peek[1] == 0x78) || (peek[0] == 0x79 && peek[1] == 0x79)) {
-		return PROTO_GT06, peek[:min(32, len(peek))], nil
+		return "", peek[:min(32, len(peek))], fmt.Errorf("unknown starting bytes")
 	}
-
-	// UniGuard: ASCII starting with "S168"
-	trim := strings.TrimSpace(string(peek))
-	if strings.HasPrefix(trim, "S168") {
-		return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
-	}
-
-	// Fallback: mostly ASCII, has '#', and contains S168
-	if isMostlyASCII(peek) && bytes.Contains(peek, []byte("#")) && bytes.Contains(peek, []byte("S168")) {
-		return PROTO_UNIGUARD, peek[:min(32, len(peek))], nil
-	}
-
-	return "", peek[:min(32, len(peek))], fmt.Errorf("unknown starting bytes")
 }
+
 
 func sanitizeASCII(b []byte) string {
 	out := make([]byte, len(b))
